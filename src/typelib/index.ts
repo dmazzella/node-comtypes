@@ -1,0 +1,12 @@
+export { loadTypeLib, loadRegisteredTypeLib, registeredTypeLibPath, registeredVersions, typeLibOf, typeLibOfClass, createTypeLib, registerTypeLib, unregisterTypeLib, SYSKIND } from "./load.ts";
+export type { RegisteredTypeLib, RegisterTypeLibOptions, TypeLibIdentity, TypeLibPointer, TypeLibSource, TypeLibVersion } from "./load.ts";
+export { readTypeLib } from "./model.ts";
+export type { AliasModel, CoClassModel, DefaultValue, DispInterfaceModel, EnumModel, FuncModel, InterfaceModel, ModuleModel, ParamModel, PropertyModel, RecordModel, TypeLibModel, TypeModel, TypeRef } from "./model.ts";
+export { buildModule, builtinInterfaceDefs, decodeDefault } from "./build.ts";
+export type { TypeLibModule } from "./build.ts";
+export { isCoClass, typeLibLocationOf } from "./coclass.ts";
+export type { CoClass, TypeLibLocation } from "./coclass.ts";
+export { GetModule } from "./getmodule.ts";
+export type { GetModuleOptions } from "./getmodule.ts";
+export { generateModule, writeModule, moduleFileName, identifier } from "./generate.ts";
+export type { GenerateOptions } from "./generate.ts";

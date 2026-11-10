@@ -1,0 +1,90 @@
+{
+  "name": "@node-ctypes/comtypes",
+  "version": "0.1.0",
+  "description": "Typed Windows COM client and server support for Node.js powered by node-ctypes, inspired by Python comtypes",
+  "author": "Damiano Mazzella",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmazzella/node-comtypes.git"
+  },
+  "homepage": "https://github.com/dmazzella/node-comtypes#readme",
+  "bugs": {
+    "url": "https://github.com/dmazzella/node-comtypes/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "node-comtypes": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./low-level": {
+      "types": "./dist/low-level/index.d.ts",
+      "import": "./dist/low-level/index.js"
+    },
+    "./interfaces": {
+      "types": "./dist/interfaces/index.d.ts",
+      "import": "./dist/interfaces/index.js"
+    },
+    "./automation": {
+      "types": "./dist/automation/index.d.ts",
+      "import": "./dist/automation/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./typelib": {
+      "types": "./dist/typelib/index.d.ts",
+      "import": "./dist/typelib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "keywords": [
+    "com",
+    "comtypes",
+    "ole",
+    "automation",
+    "idispatch",
+    "windows",
+    "ffi",
+    "node-ctypes"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.ts",
+    "typecheck": "tsc -p tsconfig.json && npm run test:types",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "test:types": "tsc -p tests/tsconfig.json && tsc -p tests/types/tsconfig.json",
+    "test": "npm run build && npm run test:types && node --test --test-concurrency=1 \"tests/checks/*.test.ts\" \"tests/src/*.test.ts\"",
+    "test:unit": "npm run build && node --test \"tests/checks/unit.*.test.ts\"",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "node-ctypes": "^2.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "~6.0.3"
+  }
+}

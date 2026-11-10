@@ -1,0 +1,55 @@
+name: node-comtypes
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # COM tests run on Windows (x64 and ARM64); elsewhere they are skipped and
+        # the cross-platform tests (GUID, HRESULT, layouts, VARIANT scalars,
+        # type library build and generation) still run.
+        os: [windows-latest, windows-11-arm, ubuntu-latest, macos-latest]
+        node: ["24", "26"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: npm pack --dry-run
+
+  publish:
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm Trusted Publishing (OIDC), no token secret
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install -g npm@^11.5.1 # Trusted Publishing requires npm 11.5.1+
+      - name: Validate release tag
+        run: test "refs/tags/v$(node -p "require('./package.json').version")" = "$GITHUB_REF"
+      - run: npm install --ignore-scripts --no-audit --no-fund
+      - run: npm run build
+      # The test matrix already ran (COM tests need Windows): skip prepublishOnly.
+      - name: Publish
+        run: |
+          tag=latest
+          case "$(node -p "require('./package.json').version")" in *-*) tag=next ;; esac
+          npm publish --access public --provenance --ignore-scripts --tag "$tag"

@@ -1,0 +1,10 @@
+This package calls the Windows COM runtime (ole32.dll, oleaut32.dll) through node-ctypes.
+It does not distribute any Windows component.
+
+Its API and design are modelled on Python comtypes, distributed under the MIT License:
+https://github.com/enthought/comtypes
+https://github.com/enthought/comtypes/blob/main/LICENSE.txt
+
+No comtypes source code is included. Interface definitions follow the Windows SDK
+headers and the Microsoft documentation:
+https://learn.microsoft.com/windows/win32/com/

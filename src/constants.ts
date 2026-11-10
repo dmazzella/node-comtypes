@@ -1,0 +1,28 @@
+// CoInitializeEx flags (COINIT).
+export const COINIT_MULTITHREADED = 0x0;
+export const COINIT_APARTMENTTHREADED = 0x2;
+export const COINIT_DISABLE_OLE1DDE = 0x4;
+export const COINIT_SPEED_OVER_MEMORY = 0x8;
+
+// Class contexts (CLSCTX).
+export const CLSCTX_INPROC_SERVER = 0x1;
+export const CLSCTX_INPROC_HANDLER = 0x2;
+export const CLSCTX_LOCAL_SERVER = 0x4;
+export const CLSCTX_REMOTE_SERVER = 0x10;
+export const CLSCTX_NO_CODE_DOWNLOAD = 0x400;
+export const CLSCTX_NO_FAILURE_LOG = 0x4000;
+export const CLSCTX_DISABLE_AAA = 0x8000;
+export const CLSCTX_ENABLE_AAA = 0x10000;
+export const CLSCTX_FROM_DEFAULT_CONTEXT = 0x20000;
+export const CLSCTX_ACTIVATE_32_BIT_SERVER = 0x40000;
+export const CLSCTX_ACTIVATE_64_BIT_SERVER = 0x80000;
+export const CLSCTX_INPROC = CLSCTX_INPROC_SERVER | CLSCTX_INPROC_HANDLER;
+export const CLSCTX_SERVER = CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER;
+export const CLSCTX_ALL = CLSCTX_INPROC_SERVER | CLSCTX_INPROC_HANDLER | CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER;
+
+// Apartment types (APTTYPE) returned by CoGetApartmentType.
+export const APTTYPE_CURRENT = -1;
+export const APTTYPE_STA = 0;
+export const APTTYPE_MTA = 1;
+export const APTTYPE_NA = 2;
+export const APTTYPE_MAINSTA = 3;
