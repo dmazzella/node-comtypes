@@ -237,7 +237,7 @@ describe("structure views", () => {
     view.value = 7.5;
     assert.equal(backing.readUInt16LE(0), VT_R8, "writes go to the wrapped memory");
     assert.equal(new VARIANT(backing).value, 7.5);
-    assert.equal(VARIANT.from(Buffer.from([1, 2])).vt, VT_ARRAY | VT_UI1);
+    // VARIANT.from(Buffer) creates a SAFEARRAY (oleaut32, Windows only): tests/src/variant.test.ts.
     const bytes = Buffer.alloc(16);
     const guid = new GUID(bytes);
     guid.Data1 = 0x12345678;
