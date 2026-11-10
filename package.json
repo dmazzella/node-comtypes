@@ -1,6 +1,6 @@
 {
   "name": "@node-ctypes/comtypes",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Typed Windows COM client and server support for Node.js powered by node-ctypes, inspired by Python comtypes",
   "author": "Damiano Mazzella",
   "license": "MIT",

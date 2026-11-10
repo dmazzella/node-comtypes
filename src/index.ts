@@ -66,4 +66,4 @@ export { marshalInterface, unmarshalInterface, unmarshalDispatch, releaseMarshal
 export type { MarshaledInterface } from "./threads.ts";
 export type { MessagePump } from "./pump.ts";
 
-export const version = "0.1.0";
+export const version = "0.1.1";
