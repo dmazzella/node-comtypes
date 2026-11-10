@@ -584,7 +584,7 @@ npm test             # everything; COM tests are skipped outside Windows
 npm pack --dry-run   # package contents
 ```
 
-The [CI workflow](./.github/workflows/ci.yml) runs `npm test` with Node.js 24 and 26 on Windows x64 and ARM64, where the COM tests run, and on Linux and macOS, where they are skipped. It is discovered only when this package is a repository root, not while nested in another repository. Pushing a `v<version>` tag that matches `package.json` publishes to npm once the whole matrix passes (npm Trusted Publishing; versions with a `-` go to `next`).
+The [CI workflow](./.github/workflows/ci.yml) runs `npm test` with Node.js 24 and 26 on Windows x64 and ARM64. It is discovered only when this package is a repository root, not while nested in another repository. Pushing a `v<version>` tag that matches `package.json` publishes to npm once the whole matrix passes (npm Trusted Publishing; versions with a `-` go to `next`).
 
 Examples, after a build (`node examples/<name>.ts`):
 
