@@ -1,5 +1,6 @@
 import * as ctypes from "node-ctypes";
 import { COMError, systemMessage } from "../errors.ts";
+import type { ResultLocation } from "../executor/apartment.ts";
 import { GUID_NULL } from "../guid.ts";
 import { DISP_E_EXCEPTION, DISP_E_PARAMNOTFOUND, DISP_E_TYPEMISMATCH, DISP_E_UNKNOWNNAME } from "../hresult.ts";
 import type { InterfacePointer } from "../interface.ts";
@@ -8,6 +9,8 @@ import { POINTER_SIZE, takeBSTR } from "../low-level/native.ts";
 import { DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPID_PROPERTYPUT, LOCALE_NEUTRAL } from "./constants.ts";
 import { DISPPARAMS, EXCEPINFO } from "./types.ts";
 import { ByRef, VARIANT, VARIANT_SIZE, byRefArgument, clearVariant, missing, readVariant, writeVariant } from "./variant.ts";
+import { invokeSlotAsync, sync } from "../pointer.ts";
+import { linkOperation } from "../executor/operations.ts";
 
 export type DispatchPointer = InterfacePointer<typeof IDispatch>;
 
@@ -35,7 +38,7 @@ export function getIDsOfNames(dispatch: DispatchPointer, names: readonly string[
   const { pointers, keep } = wideStrings(names);
   const dispids = Buffer.alloc(4 * names.length);
   try {
-    dispatch.GetIDsOfNames(GUID_NULL, pointers, names.length, lcid, dispids);
+    sync(dispatch).GetIDsOfNames(GUID_NULL, pointers, names.length, lcid, dispids);
   } catch (error) {
     if (error instanceof COMError && error.hresult === DISP_E_UNKNOWNNAME) {
       throw new COMError(DISP_E_UNKNOWNNAME, { method: `IDispatch::GetIDsOfNames(${names.join(", ")})`, text: `Unknown name ${JSON.stringify(names[0])}${names.length > 1 ? " or one of its named arguments" : ""}`, cause: error });
@@ -66,14 +69,24 @@ function exceptionError(info: EXCEPINFO, method: string, cause: unknown): COMErr
   return new COMError(DISP_E_EXCEPTION, { method, details: { description, source, helpFile, helpContext: info.dwHelpContext, guid: null, scode: info.scode }, cause });
 }
 
-/**
- * `IDispatch::Invoke`. Positional arguments are converted to VARIANTs
- * (`undefined` is an omitted optional argument; `byRef(value)` is passed by
- * reference and updated after the call); for property puts the last
- * positional argument is the value. Returns the converted result; COM objects
- * are new owned pointers.
- */
-export function invoke(dispatch: DispatchPointer, dispid: number, flags: number, args: readonly unknown[] = [], options: InvokeOptions = {}): unknown {
+interface PreparedInvoke {
+  /** Native arguments of `IDispatch::Invoke` (after `this`). */
+  readonly args: unknown[];
+  /** Memory referenced by address from `DISPPARAMS`: alive as long as this object. */
+  readonly keep: readonly Buffer[];
+  /** The JavaScript argument values, for the executor's transfer check. */
+  readonly values: readonly unknown[];
+  /** Receives the result (not passed for property puts). */
+  readonly result: VARIANT;
+  readonly put: boolean;
+  /** The error to throw for a failed call. */
+  translate(error: unknown): unknown;
+  /** Reads back `ByRef` arguments and frees the argument and result VARIANTs. */
+  dispose(): void;
+}
+
+// Converts the arguments; on failure, frees what was already converted.
+function prepareInvoke(dispid: number, flags: number, args: readonly unknown[], options: InvokeOptions): PreparedInvoke {
   const put = (flags & (DISPATCH_PROPERTYPUT | DISPATCH_PROPERTYPUTREF)) !== 0;
   if (put && !args.length) throw new TypeError("A property put requires a value");
   const positional = put ? args.slice(0, -1) : [...args];
@@ -96,6 +109,12 @@ export function invoke(dispatch: DispatchPointer, dispid: number, flags: number,
   const info = new EXCEPINFO();
   const argumentError = new ctypes.c_uint32();
   const references: { finish(): void }[] = [];
+  const dispose = () => {
+    // ByRef arguments: read back what the callee left, then release it.
+    for (const reference of references) reference.finish();
+    for (let index = 0; index < count; index++) clearVariant(variants.subarray(index * VARIANT_SIZE, (index + 1) * VARIANT_SIZE));
+    result.clear();
+  };
   try {
     values.forEach((value, index) => {
       const slot = variants.subarray(index * VARIANT_SIZE, (index + 1) * VARIANT_SIZE);
@@ -107,28 +126,78 @@ export function invoke(dispatch: DispatchPointer, dispid: number, flags: number,
         throw new TypeError(`${method}: cannot convert argument ${position}: ${(error as Error).message}`, { cause: error });
       }
     });
-    const params = new DISPPARAMS();
-    params.rgvarg = count ? ctypes.addressof(variants) : null;
-    params.rgdispidNamedArgs = namedDispids.length ? ctypes.addressof(dispids) : null;
-    params.cArgs = count;
-    params.cNamedArgs = namedDispids.length;
-    try {
-      dispatch.Invoke(dispid, GUID_NULL, options.lcid ?? defaultLCID, flags, params, put ? null : result, info, ctypes.byref(argumentError));
-    } catch (error) {
-      if (!(error instanceof COMError)) throw error;
-      if (error.hresult === DISP_E_EXCEPTION) throw exceptionError(info, method, error);
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+  const params = new DISPPARAMS();
+  params.rgvarg = count ? ctypes.addressof(variants) : null;
+  params.rgdispidNamedArgs = namedDispids.length ? ctypes.addressof(dispids) : null;
+  params.cArgs = count;
+  params.cNamedArgs = namedDispids.length;
+  return {
+    args: [dispid, GUID_NULL, options.lcid ?? defaultLCID, flags, params, put ? null : result, info, ctypes.byref(argumentError)],
+    keep: [variants, dispids],
+    values,
+    result,
+    put,
+    translate(error) {
+      if (!(error instanceof COMError)) return error;
+      if (error.hresult === DISP_E_EXCEPTION) return exceptionError(info, method, error);
       if (error.hresult === DISP_E_TYPEMISMATCH || error.hresult === DISP_E_PARAMNOTFOUND) {
         const index = argumentError.value;
         const argumentIndex = index < namedValues.length ? index : count - 1 - index;
-        throw new COMError(error.hresult, { method, details: { description: null, source: null, helpFile: null, helpContext: 0, guid: null, argumentIndex }, cause: error });
+        return new COMError(error.hresult, { method, details: { description: null, source: null, helpFile: null, helpContext: 0, guid: null, argumentIndex }, cause: error });
       }
-      throw new COMError(error.hresult, { method, details: error.details, cause: error });
+      return new COMError(error.hresult, { method, details: error.details, cause: error });
+    },
+    dispose,
+  };
+}
+
+/**
+ * `IDispatch::Invoke`. Positional arguments are converted to VARIANTs
+ * (`undefined` is an omitted optional argument; `byRef(value)` is passed by
+ * reference and updated after the call); for property puts the last
+ * positional argument is the value. Returns the converted result; COM objects
+ * are new owned pointers.
+ */
+export function invoke(dispatch: DispatchPointer, dispid: number, flags: number, args: readonly unknown[] = [], options: InvokeOptions = {}): unknown {
+  const prepared = prepareInvoke(dispid, flags, args, options);
+  try {
+    try {
+      (sync(dispatch).Invoke as (...args: unknown[]) => unknown)(...prepared.args);
+    } catch (error) {
+      throw prepared.translate(error);
     }
-    return readVariant(result._buffer);
+    return readVariant(prepared.result._buffer);
   } finally {
-    // ByRef arguments: read back what the callee left, then release it.
-    for (const reference of references) reference.finish();
-    for (let index = 0; index < count; index++) clearVariant(variants.subarray(index * VARIANT_SIZE, (index + 1) * VARIANT_SIZE));
-    result.clear();
+    prepared.dispose();
   }
+}
+
+/**
+ * {@link invoke} on the COM executor: the VARIANTs are built and read on the
+ * JavaScript thread, `Invoke` runs on the executor (or on the home thread
+ * when the object or an argument must stay there).
+ */
+export function invokeAsync(dispatch: DispatchPointer, dispid: number, flags: number, args: readonly unknown[] = [], options: InvokeOptions = {}): Promise<unknown> {
+  let prepared: PreparedInvoke;
+  try {
+    prepared = prepareInvoke(dispid, flags, args, options);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  const slot = dispatch.interface.methodIndex.get("Invoke")!;
+  const results: ResultLocation[] = prepared.put ? [] : [{ location: ctypes.addressof(prepared.result._buffer), kind: "variant" }];
+  const call = invokeSlotAsync(dispatch, slot, prepared.args, { inspect: prepared.values, results });
+  const converted = call
+    .then(
+      () => readVariant(prepared.result._buffer),
+      (error: unknown) => {
+        throw prepared.translate(error);
+      },
+    )
+    .finally(() => prepared.dispose());
+  return linkOperation(converted, call);
 }

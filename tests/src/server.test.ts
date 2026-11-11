@@ -99,48 +99,42 @@ class Calc extends COMObject {
 }
 
 describe("COMObject (vtable)", { skip }, () => {
-  it("implements COMMETHODs: arguments, results, properties and SELF", () => {
+  it("implements COMMETHODs: arguments, results, properties and SELF", async () => {
     using _ = apartment();
     const calc = new Calc();
     assert.equal(calc.refCount, 0);
     {
       using pointer = calc.QueryInterface(ICalc);
       assert.equal(calc.refCount, 1);
-      assert.equal(pointer.Add(2, 3), 5);
-      assert.equal(pointer.Add(41), 42, "optional argument with default");
+      assert.equal(await pointer.Add(2, 3), 5);
+      assert.equal(await pointer.Add(41), 42, "optional argument with default");
       assert.equal(pointer.Name, "calc");
       pointer.Name = "renamed";
       assert.equal(calc.Name, "renamed");
-      assert.deepEqual(pointer.Echo([1, "x", null]), [1, "x", null]);
-      assert.equal((pointer.Echo(new Date(2020, 1, 3)) as Date).getTime(), new Date(2020, 1, 3).getTime());
-      assert.deepEqual(pointer.Twice(4, "ab"), [8, "abab"]);
-      using self = pointer.Self()!;
+      assert.deepEqual(await pointer.Echo([1, "x", null]), [1, "x", null]);
+      assert.equal(((await pointer.Echo(new Date(2020, 1, 3))) as Date).getTime(), new Date(2020, 1, 3).getTime());
+      assert.deepEqual(await pointer.Twice(4, "ab"), [8, "abab"]);
+      using self = (await pointer.Self())!;
       assert.ok(self.isSameObject(pointer));
-      assert.equal(pointer.Raw(7), 0);
+      assert.equal(await pointer.Raw(7), 0);
       assert.equal(calc.lastRaw, 7);
-      assert.throws(
-        () => pointer.Raw(-1),
-        (error: unknown) => error instanceof COMError && error.hresult === E_NOTIMPL,
-      );
-      assert.throws(
-        () => pointer.Missing(),
-        (error: unknown) => error instanceof COMError && error.hresult === E_NOTIMPL,
-      );
+      await assert.rejects(pointer.Raw(-1), (error: unknown) => error instanceof COMError && error.hresult === E_NOTIMPL);
+      await assert.rejects(pointer.Missing(), (error: unknown) => error instanceof COMError && error.hresult === E_NOTIMPL);
     }
     assert.equal(calc.refCount, 0);
     assert.equal(calc.released, 1, "_final_release_ runs at zero references");
   });
 
-  it("reports exceptions through IErrorInfo", () => {
+  it("reports exceptions through IErrorInfo", async () => {
     using _ = apartment();
     using pointer = new Calc().QueryInterface(ICalc);
-    assert.throws(
-      () => pointer.Fail("boom"),
+    await assert.rejects(
+      pointer.Fail("boom"),
       (error: unknown) => error instanceof COMError && error.hresult < 0 && error.method === "ICalc::Fail" && error.details?.description === "boom" && error.details.source === "Calc" && Boolean(error.details.guid?.equals(ICalc.iid)),
     );
     using support = pointer.QueryInterface(ISupportErrorInfo);
-    assert.equal(support.InterfaceSupportsErrorInfo(ICalc.iid), 0);
-    assert.equal(support.InterfaceSupportsErrorInfo("{00000000-0000-0000-0000-000000000001}"), 1);
+    assert.equal(await support.InterfaceSupportsErrorInfo(ICalc.iid), 0);
+    assert.equal(await support.InterfaceSupportsErrorInfo("{00000000-0000-0000-0000-000000000001}"), 1);
   });
 
   it("answers QueryInterface for its interfaces and their bases only", () => {
@@ -162,74 +156,73 @@ describe("COMObject (vtable)", { skip }, () => {
     );
   });
 
-  it("is passed to native code and released by it", () => {
+  it("is passed to native code and released by it", async () => {
     using _ = apartment();
     const calc = new Calc();
     {
-      using dict = CreateObject("Scripting.Dictionary");
-      dict.Add("calc", calc);
+      // Created on the home thread: the dictionary holds the object itself (no proxy).
+      using dict = await CreateObject("Scripting.Dictionary", { home: true });
+      await dict.Add("calc", calc);
       assert.equal(calc.refCount, 1, "the dictionary holds a reference");
       using stored = dict.Item("calc");
-      assert.equal(stored.Add(1, 2), 3);
+      assert.equal(await stored.Add(1, 2), 3);
       using variant = new VARIANT(calc);
       assert.equal(calc.refCount, 3);
-      dict.RemoveAll();
+      await dict.RemoveAll();
     }
     assert.equal(calc.refCount, 0);
   });
 
-  it("does not leak objects or pointers", () => {
+  it("does not leak objects or pointers", async () => {
     using _ = apartment();
     const objects = getLiveObjectCount();
     const pointers = getLivePointerCount();
     for (let i = 0; i < 300; i++) {
       using pointer = new Calc().QueryInterface(ICalc);
-      using self = pointer.Self()!;
-      assert.equal(self.Add(i, 1), i + 1);
+      using self = (await pointer.Self())!;
+      assert.equal(await self.Add(i, 1), i + 1);
       using dynamic = Dispatch(pointer);
-      assert.equal(dynamic.Add(i, 2), i + 2);
+      assert.equal(await dynamic.Add(i, 2), i + 2);
     }
     assert.equal(getLiveObjectCount(), objects);
     assert.equal(getLivePointerCount(), pointers);
   });
 
-  it("supports thread-safe callbacks (free threading) called from the JavaScript thread", () => {
+  it("supports thread-safe callbacks (free threading) called from the JavaScript thread", async () => {
     class FreeCalc extends Calc {
       static _threading_ = "free" as const;
     }
     using _ = apartment();
     using pointer = new FreeCalc().QueryInterface(ICalc);
-    assert.equal(pointer.Add(20, 22), 42);
+    assert.equal(await pointer.Add(20, 22), 42);
     assert.equal(pointer.Name, "calc");
   });
 });
 
 describe("COMObject (IDispatch)", { skip }, () => {
-  it("serves late-bound calls from dual interfaces and JavaScript members", () => {
+  it("serves late-bound calls from dual interfaces and JavaScript members", async () => {
     using _ = apartment();
     const calc = new Calc();
     using dynamic = Dispatch(calc);
-    assert.equal(dynamic.Add(4, 5), 9);
+    assert.equal(await dynamic.Add(4, 5), 9);
     assert.equal(dynamic.Name, "calc");
     dynamic.Name = "late";
     assert.equal(calc.Name, "late");
-    assert.equal(dynamic(), "late", "DISPID_VALUE is the default member");
+    // Without type information the default member is called as a method.
+    assert.equal(await dynamic(), "late", "DISPID_VALUE is the default member");
     assert.equal(dynamic.released, 0, "JavaScript fields are members too");
     assert.deepEqual([...dynamic], [1, "two", 3], "iterables answer _NewEnum");
-    assert.equal(dynamic.Add(named({ a: 10, b: 5 })), 15, "named arguments of COMMETHOD specs");
+    assert.equal(await dynamic.Add(named({ a: 10, b: 5 })), 15, "named arguments of COMMETHOD specs");
   });
 
-  it("returns DISP_E_* errors and EXCEPINFO", () => {
+  it("returns DISP_E_* errors and EXCEPINFO", async () => {
     using _ = apartment();
     using dynamic = Dispatch(new Calc());
     assert.throws(
       () => dynamic.Nope,
       (error: unknown) => error instanceof COMError && error.hresult === DISP_E_UNKNOWNNAME,
     );
-    assert.throws(
-      () => dynamic.Fail("late boom"),
-      (error: unknown) => error instanceof COMError && error.hresult === DISP_E_EXCEPTION && error.details?.description === "late boom" && error.details.source === "Calc",
-    );
+    await assert.rejects(dynamic.Fail("late boom"), (error: unknown) => error instanceof COMError && error.hresult === DISP_E_EXCEPTION && error.details?.description === "late boom" && error.details.source === "Calc");
     class Plain extends COMObject {
       static _com_interfaces_ = [IDispatch];
       value = 1;
@@ -239,30 +232,27 @@ describe("COMObject (IDispatch)", { skip }, () => {
     }
     using plain = Dispatch(new Plain());
     assert.equal(plain.value, 1);
-    assert.equal(plain.method(), "called");
-    assert.throws(
-      () => plain(),
-      (error: unknown) => error instanceof COMError && error.hresult === DISP_E_MEMBERNOTFOUND,
-    );
+    assert.equal(await plain.method(), "called");
+    await assert.rejects(plain(), (error: unknown) => error instanceof COMError && error.hresult === DISP_E_MEMBERNOTFOUND);
   });
 
-  it("enumerates with VariantEnumerator", () => {
+  it("enumerates with VariantEnumerator", async () => {
     using _ = apartment();
     using enumerator = new VariantEnumerator(["a", 2, true]).QueryInterface(IEnumVARIANT);
     using item = new VARIANT();
     const fetched = new ctypes.c_uint32();
-    assert.equal(enumerator.Next(1, item, ctypes.byref(fetched)), 0);
+    assert.equal(await enumerator.Next(1, item, ctypes.byref(fetched)), 0);
     assert.equal(item.value, "a");
     item.clear();
-    assert.equal(enumerator.Skip(1), 0);
-    using clone = enumerator.Clone()!;
-    assert.equal(clone.Next(1, item, ctypes.byref(fetched)), 0);
+    assert.equal(await enumerator.Skip(1), 0);
+    using clone = (await enumerator.Clone())!;
+    assert.equal(await clone.Next(1, item, ctypes.byref(fetched)), 0);
     assert.equal(item.value, true);
     item.clear();
-    assert.equal(clone.Next(1, item, ctypes.byref(fetched)), 1, "S_FALSE at the end");
+    assert.equal(await clone.Next(1, item, ctypes.byref(fetched)), 1, "S_FALSE at the end");
     assert.equal(fetched.value, 0);
-    enumerator.Reset();
-    assert.equal(enumerator.Next(1, item, ctypes.byref(fetched)), 0);
+    await enumerator.Reset();
+    assert.equal(await enumerator.Next(1, item, ctypes.byref(fetched)), 0);
     assert.equal(item.value, "a");
   });
 });
@@ -335,8 +325,8 @@ describe("events", { skip }, () => {
   it("receives WMI events through the message pump", async () => {
     using _ = apartment();
     using pump = startMessagePump();
-    using wmi = GetObject("winmgmts:");
-    using sink = CreateObject("WbemScripting.SWbemSink");
+    using wmi = await GetObject("winmgmts:");
+    using sink = await CreateObject("WbemScripting.SWbemSink");
     const names: string[] = [];
     let completed = false;
     using connection = GetEvents(sink, {
@@ -363,13 +353,13 @@ describe("events", { skip }, () => {
 });
 
 describe("class factories and servers", { skip }, () => {
-  it("registers an in-process class object", () => {
+  it("registers an in-process class object", async () => {
     using _ = apartment();
     {
       using registration = registerClassObject(Calc, { clsctx: CLSCTX_INPROC_SERVER });
       using pointer = CoCreateInstance(Calc._reg_clsid_, ICalc, { clsctx: CLSCTX_INPROC_SERVER });
-      assert.equal(pointer.Add(1, 2), 3);
-      using dynamic = CreateObject(Calc._reg_clsid_, { clsctx: CLSCTX_INPROC_SERVER });
+      assert.equal(await pointer.Add(1, 2), 3);
+      using dynamic = await CreateObject(Calc._reg_clsid_, { clsctx: CLSCTX_INPROC_SERVER });
       assert.equal(dynamic.Name, "calc");
       void registration;
     }
@@ -390,16 +380,13 @@ describe("class factories and servers", { skip }, () => {
     let pid = 0;
     try {
       using _ = apartment();
-      using calculator = CreateObject(clsid, { clsctx: CLSCTX_LOCAL_SERVER });
+      using calculator = await CreateObject(clsid, { clsctx: CLSCTX_LOCAL_SERVER });
       pid = calculator.Pid;
       assert.notEqual(pid, process.pid);
-      assert.equal(calculator.Add(2, 40), 42);
-      assert.deepEqual(calculator.Echo([1, "x", true]), [1, "x", true]);
+      assert.equal(await calculator.Add(2, 40), 42);
+      assert.deepEqual(await calculator.Echo([1, "x", true]), [1, "x", true]);
       assert.equal(calculator.Name, "calculator");
-      assert.throws(
-        () => calculator.Fail("remote"),
-        (error: unknown) => error instanceof COMError && error.hresult === DISP_E_EXCEPTION && error.details?.description === "remote",
-      );
+      await assert.rejects(calculator.Fail("remote"), (error: unknown) => error instanceof COMError && error.hresult === DISP_E_EXCEPTION && error.details?.description === "remote");
     } finally {
       unregisterServer(Remote);
     }

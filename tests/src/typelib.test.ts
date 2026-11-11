@@ -16,6 +16,7 @@ import {
   GUID,
   GetModule,
   TYPE_E_CANTLOADLIBRARY,
+  getModuleSync,
   apartment,
   getLivePointerCount,
   loadTypeLib,
@@ -37,14 +38,14 @@ const temporary = mkdtempSync(join(tmpdir(), "node-comtypes-typelib-"));
 after(() => rmSync(temporary, { recursive: true, force: true }));
 
 describe("loading type libraries", { skip }, () => {
-  it("loads from a file, a LIBID, a ProgID and a live object", () => {
+  it("loads from a file, a LIBID, a ProgID and a live object", async () => {
     using _ = apartment();
     const names = [];
     for (const source of ["scrrun.dll", SCRIPTING_LIBID, "Scripting.Dictionary", { libid: SCRIPTING_LIBID, major: 1, minor: 0 }] as const) {
       using library = loadTypeLib(source);
       names.push(readTypeLib(library).name);
     }
-    using dict = CreateObject("Scripting.Dictionary");
+    using dict = await CreateObject("Scripting.Dictionary");
     using fromObject = typeLibOf(dict);
     names.push(readTypeLib(fromObject).name);
     assert.deepEqual(names, ["Scripting", "Scripting", "Scripting", "Scripting", "Scripting"]);
@@ -87,37 +88,86 @@ describe("loading type libraries", { skip }, () => {
 });
 
 describe("GetModule", { skip }, () => {
-  it("builds typed definitions, cached per library", () => {
+  it("is asynchronous, shares its cache with getModuleSync and one build between concurrent calls", async () => {
     using _ = apartment();
-    const Scripting = GetModule("scrrun.dll");
-    assert.equal(GetModule(SCRIPTING_LIBID), Scripting);
+    const pending = GetModule("wbemdisp.tlb");
+    assert.ok(pending instanceof Promise);
+    const concurrent = await Promise.all([pending, GetModule("wbemdisp.tlb"), GetModule("wbemdisp.tlb")]);
+    assert.ok(
+      concurrent.every((module) => module === concurrent[0]),
+      "one build",
+    );
+    assert.equal(getModuleSync("wbemdisp.tlb"), concurrent[0], "the same cache");
+    const Shell = getModuleSync("shell32.dll");
+    assert.equal(await GetModule("shell32.dll"), Shell);
+  });
+
+  it("reads the library of an object in another apartment in this one", async () => {
+    using _ = apartment();
+    // Created on the executor: this single-threaded apartment holds a proxy, and so does its library.
+    using dict = await CreateObject("Scripting.Dictionary");
+    using library = typeLibOf(dict);
+    const loaded = loadTypeLib(library);
+    try {
+      assert.notEqual(loaded.address, library.address, "a library loaded in this apartment, not the proxy");
+    } finally {
+      loaded.Release();
+    }
+    assert.equal(await GetModule(library), await GetModule("scrrun.dll"));
+  });
+
+  it("leaves the event loop free while a large library loads", { timeout: 60_000 }, async () => {
+    using _ = apartment();
+    let last = performance.now();
+    let longest = 0;
+    let ticks = 0;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      longest = Math.max(longest, now - last);
+      last = now;
+      ticks++;
+    }, 1);
+    const started = performance.now();
+    try {
+      const MSHTML = await GetModule("mshtml.tlb");
+      assert.ok(Object.keys(MSHTML).length > 1000);
+    } finally {
+      clearInterval(timer);
+    }
+    const elapsed = performance.now() - started;
+    // Each type is read and built in one go: the longest pause is one type, not the library.
+    assert.ok(longest < Math.min(500, elapsed / 4), `longest pause ${longest.toFixed(0)} ms during ${elapsed.toFixed(0)} ms`);
+    assert.ok(ticks > 50, `timers ran (${ticks})`);
+  });
+
+  it("builds typed definitions, cached per library", async () => {
+    using _ = apartment();
+    const Scripting = await GetModule("scrrun.dll");
+    assert.equal(await GetModule(SCRIPTING_LIBID), Scripting);
     assert.equal(Scripting.library.name, "Scripting");
     assert.deepEqual({ ...(Scripting.SpecialFolderConst as object) }, { WindowsFolder: 0, SystemFolder: 1, TemporaryFolder: 2 });
     const before = getLivePointerCount();
     {
-      using dict = CreateObject(Scripting.Dictionary as CoClass) as unknown as Record<string, (...args: unknown[]) => unknown> & COMPointer;
+      using dict = (await CreateObject(Scripting.Dictionary as CoClass)) as unknown as Record<string, (...args: unknown[]) => Promise<unknown>> & COMPointer;
       assert.equal(dict.interface.name, "IDictionary", "the coclass default interface (vtable)");
-      dict.Add("a", 1);
-      dict.Add("b", [1, 2]);
+      await dict.Add("a", 1);
+      await dict.Add("b", [1, 2]);
       assert.equal((dict as unknown as { Count: number }).Count, 2);
-      assert.deepEqual(dict.Items(), [1, [1, 2]]);
-      assert.throws(
-        () => dict.Add("a", 3),
-        (error: unknown) => error instanceof COMError && error.method === "IDictionary::Add",
-      );
+      assert.deepEqual(await dict.Items(), [1, [1, 2]]);
+      await assert.rejects(dict.Add("a", 3), (error: unknown) => error instanceof COMError && error.method === "IDictionary::Add");
     }
     {
-      using fso = CreateObject(Scripting.FileSystemObject as CoClass) as unknown as COMPointer & Record<string, (...args: unknown[]) => COMPointer & Record<string, unknown>>;
-      using folder = fso.GetSpecialFolder(2);
+      using fso = (await CreateObject(Scripting.FileSystemObject as CoClass)) as unknown as COMPointer & Record<string, (...args: unknown[]) => Promise<COMPointer & Record<string, unknown>>>;
+      using folder = await fso.GetSpecialFolder(2);
       assert.equal(folder.interface.name, "IFolder", "interface results are typed (lazy references)");
       assert.equal(typeof folder.Path, "string");
     }
     assert.equal(getLivePointerCount(), before);
   });
 
-  it("calls dispinterface properties through IDispatch (stdole Font)", () => {
+  it("calls dispinterface properties through IDispatch (stdole Font)", async () => {
     using _ = apartment();
-    const stdole = GetModule("stdole2.tlb");
+    const stdole = await GetModule("stdole2.tlb");
     const Font = stdole.Font as InterfaceDef<any>;
     assert.equal(Font.allMethods.length, 7);
     class FONTDESC extends ctypes.Structure {
@@ -151,15 +201,15 @@ describe("GetModule", { skip }, () => {
     void name;
   });
 
-  it("writes the generated module to a cache directory", () => {
+  it("writes the generated module to a cache directory", async () => {
     using _ = apartment();
-    GetModule("scrrun.dll", { cacheDir: temporary });
+    await GetModule("scrrun.dll", { cacheDir: temporary });
     assert.ok(existsSync(join(temporary, "Scripting.ts")));
   });
 
-  it("gives JavaScript objects the type information of type library interfaces", () => {
+  it("gives JavaScript objects the type information of type library interfaces", async () => {
     using _ = apartment();
-    const Scripting = GetModule("scrrun.dll");
+    const Scripting = await GetModule("scrrun.dll");
     class JsDictionary extends COMObject {
       static _com_interfaces_ = [Scripting.IDictionary as InterfaceDef<any>];
       #items = new Map<string, unknown>();
@@ -175,9 +225,9 @@ describe("GetModule", { skip }, () => {
     }
     using dynamic = Dispatch(new JsDictionary());
     assert.equal(typeName(dynamic), "IDictionary");
-    dynamic.Add("k", 1);
+    await dynamic.Add("k", 1);
     assert.equal(dynamic.Count, 1);
-    assert.equal(dynamic.Exists("k"), true);
+    assert.equal(await dynamic.Exists("k"), true);
   });
 });
 

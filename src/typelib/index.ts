@@ -6,7 +6,7 @@ export { buildModule, builtinInterfaceDefs, decodeDefault } from "./build.ts";
 export type { TypeLibModule } from "./build.ts";
 export { isCoClass, typeLibLocationOf } from "./coclass.ts";
 export type { CoClass, TypeLibLocation } from "./coclass.ts";
-export { GetModule } from "./getmodule.ts";
+export { GetModule, getModuleSync } from "./getmodule.ts";
 export type { GetModuleOptions } from "./getmodule.ts";
 export { generateModule, writeModule, moduleFileName, identifier } from "./generate.ts";
 export type { GenerateOptions } from "./generate.ts";

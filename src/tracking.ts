@@ -57,6 +57,11 @@ export function releaseAll(): number {
   return references.length;
 }
 
+/** Apartment generation of this thread: changes when the apartment is torn down. */
+export function apartmentGeneration(): number {
+  return state.generation;
+}
+
 export function liveCount(): number {
   return state.live.size;
 }

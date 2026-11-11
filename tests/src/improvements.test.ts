@@ -58,7 +58,7 @@ class Doubler extends COMObject {
 }
 
 describe("ByRef arguments", { skip }, () => {
-  it("round-trip through IDispatch::Invoke, as VARIANTs or typed", () => {
+  it("round-trip through IDispatch::Invoke, as VARIANTs or typed", async () => {
     using _ = apartment();
     using doubler = Dispatch(new Doubler());
     const variant = byRef(21);
@@ -66,7 +66,7 @@ describe("ByRef arguments", { skip }, () => {
     const typedNumber = byRef(5, VT_I4);
     const typedText = byRef("x", VT_BSTR);
     const typedBool = byRef(false, VT_BOOL);
-    assert.equal(doubler.Twice(variant, text, 7, typedNumber, typedText, typedBool), 5);
+    assert.equal(await doubler.Twice(variant, text, 7, typedNumber, typedText, typedBool), 5);
     assert.deepEqual([variant.value, text.value, typedNumber.value, typedText.value, typedBool.value], [42, "abab", 10, "xx", true]);
     assert.throws(() => byRef(1, VT_I4 | 0x4000), RangeError);
     assert.throws(() => new VARIANT(byRef(1)), TypeError);
@@ -94,9 +94,9 @@ describe("ByRef arguments", { skip }, () => {
 });
 
 describe("VT_RECORD", { skip: skip || (!existsSync(DRAWING) && "System.Drawing.tlb (.NET Framework 4) is not installed") }, () => {
-  it("converts records with IRecordInfo", () => {
+  it("converts records with IRecordInfo", async () => {
     using _ = apartment();
-    const Drawing = GetModule(DRAWING);
+    const Drawing = await GetModule(DRAWING);
     const point = record(Drawing.Point as object, { x: 3, y: -4 });
     using variant = new VARIANT(point);
     assert.equal(variant.vt, VT_RECORD);
@@ -115,9 +115,9 @@ describe("VT_RECORD", { skip: skip || (!existsSync(DRAWING) && "System.Drawing.t
     assert.deepEqual({ ...(fromInstance.value as object) }, { x: 1, y: 0, width: 10, height: 0 });
   });
 
-  it("stores records in SAFEARRAYs and passes them to automation objects", () => {
+  it("stores records in SAFEARRAYs and passes them to automation objects", async () => {
     using _ = apartment();
-    const Drawing = GetModule(DRAWING);
+    const Drawing = await GetModule(DRAWING);
     const points = [record(Drawing.Point as object, { x: 1, y: 2 }), record(Drawing.Point as object, { y: 7 })];
     using records = new VARIANT(safeArray(points, { vt: VT_RECORD }));
     assert.equal(records.vt, 0x2000 | VT_RECORD);
@@ -130,8 +130,8 @@ describe("VT_RECORD", { skip: skip || (!existsSync(DRAWING) && "System.Drawing.t
     );
     using variants = new VARIANT(points);
     assert.equal((variants.value as RecordValue[])[1].y, 7);
-    using dict = CreateObject("Scripting.Dictionary");
-    dict.Add("p", points[0]);
+    using dict = await CreateObject("Scripting.Dictionary");
+    await dict.Add("p", points[0]);
     assert.deepEqual({ ...dict.Item("p") }, { x: 1, y: 2 });
     assert.throws(() => record({} as object), TypeError);
   });
@@ -187,7 +187,7 @@ describe("cross-thread references", { skip }, () => {
       [42, 42, 42],
     );
     using local = table.getDispatch(cookie);
-    assert.equal(local.Add(1, 1), 2);
+    assert.equal(await local.Add(1, 1), 2);
     table.revoke(cookie);
     assert.equal(calculator.calls, 4);
     void pump;
@@ -208,18 +208,15 @@ describe("cross-thread references", { skip }, () => {
 });
 
 describe("Visual Basic error messages", { skip }, () => {
-  it("describe FACILITY_CONTROL HRESULTs", () => {
+  it("describe FACILITY_CONTROL HRESULTs", async () => {
     using _ = apartment();
     const text = systemMessage(0x800a01c9 | 0);
     // vbscript.dll is a Feature on Demand: the text is localized, or null when it is not installed.
     if (text === null) return;
     assert.ok(text.length > 0);
-    const Scripting = GetModule("scrrun.dll");
-    using dict = CreateObject(Scripting.Dictionary as CoClass) as unknown as Disposable & { Add(key: string, value: number): void };
-    dict.Add("a", 1);
-    assert.throws(
-      () => dict.Add("a", 2),
-      (error: unknown) => error instanceof COMError && error.message.includes(text),
-    );
+    const Scripting = await GetModule("scrrun.dll");
+    using dict = (await CreateObject(Scripting.Dictionary as CoClass)) as unknown as Disposable & { Add(key: string, value: number): Promise<void> };
+    await dict.Add("a", 1);
+    await assert.rejects(dict.Add("a", 2), (error: unknown) => error instanceof COMError && error.message.includes(text));
   });
 });

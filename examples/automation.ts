@@ -1,5 +1,6 @@
 // Automation: Scripting.Dictionary and FileSystemObject (typed from their type
-// library, the default) and WMI (late bound).
+// library, the default) and WMI (late bound). Methods return promises and run
+// on the COM executor; properties are synchronous.
 //
 //   npm run build && node examples/automation.ts
 
@@ -8,32 +9,34 @@ import { CreateObject, GetObject, apartment, named, putProperty } from "@node-ct
 using _ = apartment();
 
 {
-  using dict = CreateObject("Scripting.Dictionary");
-  dict.Add("name", "@node-ctypes/comtypes");
-  dict.Add("created", new Date());
-  dict.Add("values", [1, 2.5, "three", true]);
+  using dict = await CreateObject("Scripting.Dictionary");
+  await dict.Add("name", "@node-ctypes/comtypes");
+  await dict.Add("created", new Date());
+  await dict.Add("values", [1, 2.5, "three", true]);
   putProperty(dict, "Item", "name", "renamed"); // parameterized property put
-  for (const key of dict) console.log(`${key}:`, dict.Item(key));
-  console.log("Keys():", dict.Keys());
+  for await (const key of dict) console.log(`${key}:`, dict.Item(key)); // _NewEnum on the executor; Item is a property
+  console.log("Keys():", await dict.Keys());
 }
 
 {
-  using fso = CreateObject("Scripting.FileSystemObject");
-  using temp = fso.GetSpecialFolder(2);
-  const path = fso.BuildPath(temp.Path, "node-comtypes.txt");
-  using writer = fso.CreateTextFile(path, named({ Overwrite: true }));
-  writer.WriteLine("written through ITextStream");
-  writer.Close();
-  using reader = fso.OpenTextFile(path);
-  console.log(`${path}:`, reader.ReadAll().trim());
-  reader.Close();
-  fso.DeleteFile(path);
+  using fso = await CreateObject("Scripting.FileSystemObject");
+  using temp = await fso.GetSpecialFolder(2);
+  const path = await fso.BuildPath(temp.Path, "node-comtypes.txt");
+  using writer = await fso.CreateTextFile(path, named({ Overwrite: true }));
+  await writer.WriteLine("written through ITextStream");
+  await writer.Close();
+  using reader = await fso.OpenTextFile(path);
+  console.log(`${path}:`, (await reader.ReadAll()).trim());
+  await reader.Close();
+  await fso.DeleteFile(path);
 }
 
 {
   // WMI class properties (FreeSpace, Size, ...) are not in the type library: late binding.
-  using wmi = GetObject("winmgmts:", { dynamic: true });
-  for (const disk of wmi.ExecQuery("SELECT DeviceID, FreeSpace, Size FROM Win32_LogicalDisk WHERE DriveType = 3")) {
+  using wmi = await GetObject("winmgmts:", { dynamic: true });
+  using disks = await wmi.ExecQuery("SELECT DeviceID, FreeSpace, Size FROM Win32_LogicalDisk WHERE DriveType = 3");
+  // for await: the collection is enumerated on the COM executor.
+  for await (const disk of disks) {
     using owned = disk;
     const free = Number(owned.FreeSpace) / 2 ** 30;
     const size = Number(owned.Size) / 2 ** 30;

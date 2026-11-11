@@ -16,7 +16,7 @@
 
 import { parseArgs } from "node:util";
 import * as ctypes from "node-ctypes";
-import { COMInterface, COMMETHOD, GUID, GetModule, GetObject, HRESULT, IUnknown, LPOLESTR, STDMETHOD, apartment, dispatchPointer } from "@node-ctypes/comtypes";
+import { COINIT_MULTITHREADED, COMInterface, COMMETHOD, GUID, GetModule, GetObject, HRESULT, IUnknown, LPOLESTR, STDMETHOD, apartment, dispatchPointer } from "@node-ctypes/comtypes";
 import type { DispatchObject } from "@node-ctypes/comtypes";
 import { readMemory } from "@node-ctypes/comtypes/low-level";
 
@@ -33,6 +33,7 @@ function parseOptions() {
         pass: { type: "string" },
         limit: { type: "string" }, // print at most this many objects (default: all)
         tree: { type: "boolean", default: false }, // group the objects by container (OU/CN) path
+        debug: { type: "boolean", default: false },
       },
     }).values;
   } catch (error) {
@@ -44,10 +45,14 @@ function parseOptions() {
 
 const options = parseOptions();
 
-using _ = apartment();
+// A multithreaded apartment: directory objects obtained on the COM executor are
+// in the same apartment, so IDirectorySearch (a [local] interface, never marshaled)
+// is usable here and its calls run on the executor. In a single-threaded
+// apartment (e.g. Electron's main thread) use GetObject(path, { home: true }).
+using _ = apartment(COINIT_MULTITHREADED);
 
 // The Active DS type library describes the ADSI structures and enums.
-const Ads = GetModule("activeds.tlb") as any;
+const Ads = (await GetModule("activeds.tlb")) as any;
 const { ADSTYPEENUM: AdsType, ADS_SEARCHPREF_ENUM: Pref, ADS_SCOPEENUM: Scope, ADS_CHASE_REFERRALS_ENUM: Referrals, ADS_AUTHENTICATION_ENUM: Auth } = Ads;
 // MIDL names the anonymous union of ADSVALUE: read its name from the record.
 const UNION: string = Ads._adsvalue._fields_[1][0];
@@ -79,12 +84,14 @@ const IDirectorySearch = COMInterface({
 });
 
 const FreeADsMem = new ctypes.WinDLL("activeds.dll").func("FreeADsMem", ctypes.c_int32, [ctypes.c_void_p]);
+const ConvertSidToStringSidW = new ctypes.WinDLL("advapi32.dll").func("ConvertSidToStringSidW", ctypes.c_int32, [ctypes.c_void_p, ctypes.c_void_p]);
+const LocalFree = new ctypes.WinDLL("kernel32.dll").func("LocalFree", ctypes.c_void_p, [ctypes.c_void_p]);
 
 /** Bind to a directory object, with explicit credentials when given (Python: ADsOpenObject). */
-function bind(path: string): DispatchObject {
-  if (!options.user) return GetObject(path, { dynamic: true });
-  using namespace = GetObject("LDAP:", { dynamic: true });
-  return namespace.OpenDSObject(path, options.user, options.pass ?? "", Auth.ADS_SECURE_AUTHENTICATION);
+async function bind(path: string): Promise<DispatchObject> {
+  if (!options.user) return await GetObject(path, { dynamic: true });
+  using namespace = await GetObject("LDAP:", { dynamic: true });
+  return await namespace.OpenDSObject(path, options.user, options.pass ?? "", Auth.ADS_SECURE_AUTHENTICATION);
 }
 
 /** An ADS_SEARCHPREF_INFO array: [preference, value] pairs (booleans as ADSTYPE_BOOLEAN). */
@@ -105,10 +112,15 @@ function preferences(entries: readonly (readonly [number, number | boolean])[]):
 /** Large integers converted from FILETIME (100 ns ticks since 1601) to ISO 8601. */
 const FILETIMES = new Set(["badPasswordTime", "lastLogoff", "lastLogon", "lastLogonTimestamp", "pwdLastSet"]);
 
-/** Binary SID to S-1-5-21-... (revision, sub-authority count, 48-bit big-endian authority, sub-authorities). */
-function sidString(sid: Buffer): string {
-  const subAuthorities = Array.from({ length: sid[1] }, (_, index) => sid.readUInt32LE(8 + 4 * index));
-  return ["S", sid[0], sid.readUIntBE(2, 6), ...subAuthorities].join("-");
+/** A binary SID in native memory as "S-1-5-21-...", formatted by Windows. */
+function sidString(address: bigint): string | null {
+  const text = new ctypes.c_void_p();
+  if (!ConvertSidToStringSidW(address, ctypes.byref(text)) || !text.value) return null;
+  try {
+    return ctypes.wstring_at(text.value);
+  } finally {
+    LocalFree(text.value);
+  }
 }
 
 function convert(type: number, value: any, attribute: string): unknown {
@@ -138,14 +150,15 @@ function convert(type: number, value: any, attribute: string): unknown {
       const { dwLength, lpValue } = value.OctetString;
       // Empty values are skipped (filtered out by readColumn).
       if (!lpValue || !dwLength) return undefined;
-      const bytes = readMemory(lpValue, dwLength);
       switch (attribute.toLowerCase()) {
         case "objectsid":
-          return sidString(bytes);
-        case "objectguid":
+          return sidString(lpValue);
+        case "objectguid": {
+          const bytes = readMemory(lpValue, dwLength);
           return bytes.length === 16 ? new GUID(new Uint8Array(bytes)).toString() : bytes.toString("hex");
+        }
         default:
-          return bytes;
+          return readMemory(lpValue, dwLength);
       }
     }
     default:
@@ -169,8 +182,12 @@ type Row = Record<string, unknown>;
 /** First value of an attribute. */
 const first = (values: unknown) => (Array.isArray(values) ? values[0] : values);
 
-/** Rows of a search, read page by page while iterating. */
-function* search(directory: DispatchObject, filter: string, attributes: readonly string[]): Generator<Row> {
+/**
+ * Rows of a search, read page by page while iterating (`for await`). Every
+ * IDirectorySearch call runs on the COM executor: GetNextRow may wait for the
+ * server (the next page), and the event loop stays free meanwhile.
+ */
+async function* search(directory: DispatchObject, filter: string, attributes: readonly string[]): AsyncGenerator<Row> {
   using searcher = dispatchPointer(directory).QueryInterface(IDirectorySearch);
   const scope = { base: Scope.ADS_SCOPE_BASE, onelevel: Scope.ADS_SCOPE_ONELEVEL, subtree: Scope.ADS_SCOPE_SUBTREE }[options.scope.toLowerCase()];
   if (scope === undefined) throw new TypeError(`Unknown scope ${options.scope}`);
@@ -181,24 +198,24 @@ function* search(directory: DispatchObject, filter: string, attributes: readonly
     [Pref.ADS_SEARCHPREF_CHASE_REFERRALS, Referrals.ADS_CHASE_REFERRALS_ALWAYS],
     [Pref.ADS_SEARCHPREF_CACHE_RESULTS, false],
   ]);
-  searcher.SetSearchPreference(prefs, prefs.length / SEARCHPREF_SIZE);
+  await searcher.SetSearchPreference(prefs, prefs.length / SEARCHPREF_SIZE);
 
   // LPWSTR array of the attribute names; -1 (0xFFFFFFFF) for all attributes.
   const names = attributes.length ? ctypes.array(ctypes.c_wchar_p, attributes.length)(...attributes) : null;
-  const handle = searcher.ExecuteSearch(filter, names, attributes.length || 0xffffffff);
+  const handle = await searcher.ExecuteSearch(filter, names, attributes.length || 0xffffffff);
   let completed = false;
   try {
     const name = new ctypes.c_void_p();
-    while (searcher.GetNextRow(handle) !== S_ADS_NOMORE_ROWS) {
+    while ((await searcher.GetNextRow(handle)) !== S_ADS_NOMORE_ROWS) {
       const row: Row = {};
-      while (searcher.GetNextColumnName(handle, ctypes.byref(name)) !== S_ADS_NOMORE_COLUMNS) {
+      while ((await searcher.GetNextColumnName(handle, ctypes.byref(name))) !== S_ADS_NOMORE_COLUMNS) {
         try {
           const attribute = ctypes.wstring_at(name.value!) ?? "";
-          const column = searcher.GetColumn(handle, name.value);
+          const column = await searcher.GetColumn(handle, name.value);
           try {
             row[attribute] = readColumn(column, attribute);
           } finally {
-            searcher.FreeColumn(column._buffer);
+            await searcher.FreeColumn(column._buffer);
           }
         } finally {
           FreeADsMem(name.value);
@@ -213,12 +230,12 @@ function* search(directory: DispatchObject, filter: string, attributes: readonly
     // releases the search in any case.
     if (!completed) {
       try {
-        searcher.AbandonSearch(handle);
+        await searcher.AbandonSearch(handle);
       } catch {
         // Closed below.
       }
     }
-    searcher.CloseSearchHandle(handle);
+    await searcher.CloseSearchHandle(handle);
     // The attribute names (and their strings) must outlive the search: ADSI reads them while paging.
     void names;
   }
@@ -303,8 +320,8 @@ try {
 
   let base = options.base;
   if (!base) {
-    using rootDSE = bind("LDAP://RootDSE");
-    base = `LDAP://${rootDSE.Get("defaultNamingContext")}`;
+    using rootDSE = await bind("LDAP://RootDSE");
+    base = `LDAP://${await rootDSE.Get("defaultNamingContext")}`;
   }
   const attributes = options.attributes === "*" ? [] : options.attributes.split(",").map((attribute) => attribute.trim());
   // The tree is built from the distinguished names.
@@ -312,15 +329,18 @@ try {
 
   console.log(`Searching ${base} for ${options.filter}`);
   const started = performance.now();
-  using directory = bind(base);
-  const rows = [...search(directory, options.filter, attributes)];
+  using directory = await bind(base);
+  const rows: Row[] = [];
+  for await (const row of search(directory, options.filter, attributes)) rows.push(row);
   const elapsed = performance.now() - started;
   rows.sort((a, b) => String(first(a.distinguishedName) ?? "").localeCompare(String(first(b.distinguishedName) ?? "")));
 
-  // console.dir shows 100 array items by default: print every object, or `limit` of them.
-  const shown = rows.slice(0, limit);
-  console.dir(options.tree ? toTree(shown) : shown, { depth: null, maxArrayLength: null, maxStringLength: null });
-  if (rows.length > limit) console.log(`... ${rows.length - limit} more (--limit)`);
+  if (options.debug) {
+    // console.dir shows 100 array items by default: print every object, or `limit` of them.
+    const shown = rows.slice(0, limit);
+    console.dir(options.tree ? toTree(shown) : shown, { depth: null, maxArrayLength: null, maxStringLength: null });
+    if (rows.length > limit) console.log(`... ${rows.length - limit} more (--limit)`);
+  }
   console.log(`${rows.length} object(s) in ${elapsed.toFixed(0)} ms`);
 } catch (error) {
   // COMError messages include the method, the HRESULT and the ADSI description.

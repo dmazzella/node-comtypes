@@ -12,6 +12,7 @@ import { ClassFactory, COMObject, classTypeLib, getLiveObjectCount, queryObject 
 import { registerTypeLib, unregisterTypeLib } from "../typelib/load.ts";
 import { IUnknown } from "../interfaces/unknown.ts";
 import { rawRelease } from "../low-level/vtable.ts";
+import { markLocalClass, unmarkLocalClass } from "../executor/classes.ts";
 
 export const REGCLS_SINGLEUSE = 0;
 export const REGCLS_MULTIPLEUSE = 1;
@@ -46,10 +47,14 @@ export function registerClassObject(type: ComClass, options: { readonly clsctx?:
     // COM keeps its own reference while registered.
     rawRelease(address);
   }
+  // CreateObject creates objects of this class on this thread (see client/index.ts).
+  const clsid = classId(type);
+  markLocalClass(clsid);
   let registered = true;
   const revoke = () => {
     if (!registered) return;
     registered = false;
+    unmarkLocalClass(clsid);
     checkHRESULT(ole32().CoRevokeClassObject(cookie.value), "CoRevokeClassObject");
   };
   return { cookie: cookie.value, factory, revoke, [Symbol.dispose]: revoke };

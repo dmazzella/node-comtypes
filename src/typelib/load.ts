@@ -10,11 +10,12 @@ import { TYPE_E_CANTLOADLIBRARY } from "../hresult.ts";
 import type { InterfacePointer } from "../interface.ts";
 import { IDispatch } from "../interfaces/dispatch.ts";
 import { ICreateTypeLib2, IProvideClassInfo, ITypeInfo, ITypeLib, TLIBATTR } from "../interfaces/typeinfo.ts";
-import { ole32, oleaut32, takeBSTR } from "../low-level/native.ts";
+import { copyStruct, ole32, oleaut32, takeBSTR } from "../low-level/native.ts";
 import { HKEY_CLASSES_ROOT, readString, subkeys } from "../low-level/registry.ts";
 import { SYS_WIN32, SYS_WIN64 } from "../automation/constants.ts";
 import { POINTER_SIZE } from "../low-level/native.ts";
-import { COMPointer } from "../pointer.ts";
+import { COMPointer, sync } from "../pointer.ts";
+import { isProxy } from "../executor/apartment.ts";
 
 export type TypeLibPointer = InterfacePointer<typeof ITypeLib>;
 export type TypeInfoPointer = InterfacePointer<typeof ITypeInfo>;
@@ -90,7 +91,7 @@ export function typeLibOf(object: COMPointer | ComObject): TypeLibPointer {
   if (provider) {
     using owned = provider;
     try {
-      typeInfo = owned.GetClassInfo();
+      typeInfo = sync(owned).GetClassInfo();
     } catch {
       typeInfo = null;
     }
@@ -106,7 +107,7 @@ export function typeLibOf(object: COMPointer | ComObject): TypeLibPointer {
   using info = typeInfo;
   const out = new ctypes.c_void_p();
   const index = new ctypes.c_uint32();
-  info.GetContainingTypeLib(ctypes.byref(out), ctypes.byref(index));
+  sync(info).GetContainingTypeLib(ctypes.byref(out), ctypes.byref(index));
   return COMPointer.fromAddress(out.value!, ITypeLib);
 }
 
@@ -120,7 +121,7 @@ const FILE_EXTENSION = /\.(dll|tlb|olb|ocx|exe)$/i;
  * - an `ITypeLib` pointer (a new reference).
  */
 export function loadTypeLib(source: TypeLibSource): TypeLibPointer {
-  if (source instanceof COMPointer) return source.QueryInterface(ITypeLib);
+  if (source instanceof COMPointer) return inProcess(source.QueryInterface(ITypeLib));
   if (typeof source === "object") return loadRegisteredTypeLib(source);
   if (GUID.isGUIDString(source)) return loadRegisteredTypeLib({ libid: source });
   if (!FILE_EXTENSION.test(source) && !/[\\/]/.test(source) && source.includes(".")) {
@@ -132,14 +133,35 @@ export function loadTypeLib(source: TypeLibSource): TypeLibPointer {
   return COMPointer.fromAddress(out.value!, ITypeLib);
 }
 
+/**
+ * `library` itself, or, when it is a proxy (the library of an object in
+ * another apartment or process), the same registered library loaded in this
+ * apartment: reading a library makes many calls, direct instead of
+ * cross-apartment. Takes over `library`.
+ */
+function inProcess(library: TypeLibPointer): TypeLibPointer {
+  if (!isProxy(library.address)) return library;
+  try {
+    const identity = withLibAttr(library, (attr) => ({ libid: attr.guid.toString(), major: attr.wMajorVerNum, minor: attr.wMinorVerNum, lcid: attr.lcid }));
+    const local = loadRegisteredTypeLib(identity);
+    library.Release();
+    return local;
+  } catch (error) {
+    // Not registered (e.g. built in memory): read it through the proxy.
+    if (error instanceof COMError) return library;
+    library.Release();
+    throw error;
+  }
+}
+
 /** Read the `TLIBATTR` of a library. */
 export function withLibAttr<T>(library: TypeLibPointer, use: (attr: TLIBATTR) => T): T {
   const out = new ctypes.c_void_p();
-  library.GetLibAttr(ctypes.byref(out));
+  sync(library).GetLibAttr(ctypes.byref(out));
   try {
-    return use(TLIBATTR.from_address(out.value!));
+    return use(copyStruct(TLIBATTR, out.value!));
   } finally {
-    library.ReleaseTLibAttr(out.value);
+    sync(library).ReleaseTLibAttr(out.value);
   }
 }
 

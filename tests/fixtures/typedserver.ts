@@ -6,7 +6,7 @@ import type { InterfaceDef } from "@node-ctypes/comtypes";
 import { COMObject, UseCommandLine } from "@node-ctypes/comtypes/server";
 
 const [file, clsid] = process.argv.slice(2);
-const Test = GetModule(file);
+const Test = await GetModule(file);
 
 class Greeter extends COMObject {
   static _com_interfaces_ = [Test.IGreeter as InterfaceDef, Test.ICounter as InterfaceDef];

@@ -7,18 +7,19 @@ import { derivesFrom, findInterface } from "../interface.ts";
 import type { InterfaceDef } from "../interface.ts";
 import { IDispatch } from "../interfaces/dispatch.ts";
 import { IProvideClassInfo, ITypeInfo, ITypeLib } from "../interfaces/typeinfo.ts";
-import { COMPointer } from "../pointer.ts";
-import { GetModule } from "../typelib/getmodule.ts";
-import type { TypeInfoPointer } from "../typelib/load.ts";
-import { adoptDispatch, iterateNewEnum } from "./dynamic.ts";
+import { COMPointer, sync } from "../pointer.ts";
+import { GetModule, getModuleSync } from "../typelib/getmodule.ts";
+import type { TypeInfoPointer, TypeLibPointer } from "../typelib/load.ts";
+import { queryOrDispatch } from "./dual.ts";
+import { adoptDispatch, iterateNewEnum, iterateNewEnumAsync } from "./dynamic.ts";
 import type { DispatchPointer } from "../automation/dispatch.ts";
 
 /** The type info of implemented interface `index` (`-1`: the vtable part of a dual interface). */
 function implementedType(info: TypeInfoPointer, index: number): TypeInfoPointer {
   const href = new ctypes.c_uint32();
-  info.GetRefTypeOfImplType(index >>> 0, ctypes.byref(href));
+  sync(info).GetRefTypeOfImplType(index >>> 0, ctypes.byref(href));
   const out = new ctypes.c_void_p();
-  info.GetRefTypeInfo(href.value, ctypes.byref(out));
+  sync(info).GetRefTypeInfo(href.value, ctypes.byref(out));
   return COMPointer.fromAddress(out.value!, ITypeInfo);
 }
 
@@ -27,7 +28,7 @@ function defaultInterface(classInfo: TypeInfoPointer): TypeInfoPointer | null {
   const count = withTypeAttr(classInfo, (attr) => attr.cImplTypes);
   const flags = new ctypes.c_int32();
   for (let index = 0; index < count; index++) {
-    classInfo.GetImplTypeFlags(index, ctypes.byref(flags));
+    sync(classInfo).GetImplTypeFlags(index, ctypes.byref(flags));
     if ((flags.value & (IMPLTYPEFLAG_FDEFAULT | IMPLTYPEFLAG_FSOURCE)) === IMPLTYPEFLAG_FDEFAULT) return implementedType(classInfo, index);
   }
   return count === 1 ? implementedType(classInfo, 0) : null;
@@ -39,7 +40,7 @@ function objectTypeInfo(pointer: COMPointer): TypeInfoPointer | null {
   if (provider) {
     using owned = provider;
     try {
-      using classInfo = owned.GetClassInfo();
+      using classInfo = sync(owned).GetClassInfo();
       const info = classInfo ? defaultInterface(classInfo) : null;
       if (info) return info;
     } catch (error) {
@@ -67,15 +68,44 @@ function isInterfaceDef(value: unknown): value is InterfaceDef<any> {
   return typeof value === "object" && value !== null && "iid" in value && "Pointer" in value;
 }
 
+function containingLibrary(info: TypeInfoPointer): TypeLibPointer {
+  const out = new ctypes.c_void_p();
+  const index = new ctypes.c_uint32();
+  sync(info).GetContainingTypeLib(ctypes.byref(out), ctypes.byref(index));
+  return COMPointer.fromAddress(out.value!, ITypeLib);
+}
+
 /** Definition of the type described by `info`, built by `GetModule` from its type library. */
 function interfaceOf(info: TypeInfoPointer): InterfaceDef<any> | null {
   const iid = withTypeAttr(info, (attr) => attr.guid.toString());
-  const out = new ctypes.c_void_p();
-  const index = new ctypes.c_uint32();
-  info.GetContainingTypeLib(ctypes.byref(out), ctypes.byref(index));
-  using library = COMPointer.fromAddress(out.value!, ITypeLib);
-  for (const value of Object.values(GetModule(library))) if (isInterfaceDef(value) && value.iid.toString() === iid) return value;
+  using library = containingLibrary(info);
+  for (const value of Object.values(getModuleSync(library))) if (isInterfaceDef(value) && value.iid.toString() === iid) return value;
   return findInterface(iid) ?? null;
+}
+
+/**
+ * Load the type library {@link GetBestInterface} needs for `object` with
+ * `await GetModule` (in slices, without blocking the event loop), so that it
+ * finds the module cached. Objects without type information need nothing.
+ */
+export async function loadBestModule(object: COMPointer): Promise<void> {
+  let library: TypeLibPointer;
+  try {
+    using info = objectTypeInfo(object);
+    if (!info) return;
+    using vtable = dualVtable(info);
+    library = containingLibrary(vtable ?? info);
+  } catch (error) {
+    if (error instanceof COMError) return;
+    throw error;
+  }
+  using owned = library;
+  try {
+    await GetModule(owned);
+  } catch (error) {
+    // GetBestInterface falls back to the object's own interface.
+    if (!(error instanceof COMError)) throw error;
+  }
 }
 
 /**
@@ -93,17 +123,10 @@ export function GetBestInterface<T extends COMPointer>(object: T): COMPointer {
       using vtable = dualVtable(info);
       const iface = interfaceOf(vtable ?? info);
       if (iface && iface !== object.interface) {
-        const typed = object.tryQueryInterface(iface);
+        // A dispinterface, or a dual interface whose vtable cannot be marshaled,
+        // is reached through IDispatch::Invoke.
+        const typed = queryOrDispatch(object, iface);
         if (typed) return typed;
-        // A dispinterface is called through IDispatch::Invoke only: objects
-        // may not answer QueryInterface for its DIID.
-        if (iface.allMethods.length === IDispatch.allMethods.length && derivesFrom(iface, IDispatch.iid)) {
-          const dispatch = object.tryQueryInterface(IDispatch);
-          if (dispatch) {
-            using owned = dispatch;
-            return COMPointer.fromAddress(owned.address, iface, { addRef: true });
-          }
-        }
       }
     }
   } catch (error) {
@@ -133,11 +156,19 @@ function wrapOutparam(value: unknown): unknown {
 
 setOutputWrapper(wrapOutparam);
 
-// Typed dispatch pointers iterate their `_NewEnum` collection (Python: `__iter__`).
+// Typed dispatch pointers iterate their `_NewEnum` collection (Python: `__iter__`),
+// also with `for await` (IEnumVARIANT::Next on the COM executor).
 Object.defineProperty(IDispatch.Pointer.prototype, Symbol.iterator, {
   configurable: true,
   writable: true,
   value: function (this: DispatchPointer) {
     return iterateNewEnum(this, wrapOutparam);
+  },
+});
+Object.defineProperty(IDispatch.Pointer.prototype, Symbol.asyncIterator, {
+  configurable: true,
+  writable: true,
+  value: function (this: DispatchPointer) {
+    return iterateNewEnumAsync(this, wrapOutparam);
   },
 });

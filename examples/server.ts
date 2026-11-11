@@ -45,18 +45,18 @@ using connection = GetEvents(counter, { Changed: (value: number) => console.log(
 
 // Early binding: the vtable interface.
 using pointer = counter.QueryInterface(ICounter);
-pointer.Increment(5);
+await pointer.Increment(5);
 pointer.Label = "renamed";
 console.log("Label:", pointer.Label);
 
 // Late binding: IDispatch over the same object.
 using dynamic = Dispatch(counter);
-console.log("Increment():", dynamic.Increment());
+console.log("Increment():", await dynamic.Increment());
 
 // Native code holding the object: Scripting.Dictionary keeps a reference.
-using dict = CreateObject("Scripting.Dictionary");
-dict.Add("counter", counter);
+using dict = await CreateObject("Scripting.Dictionary");
+await dict.Add("counter", counter);
 console.log("references held by COM:", counter.refCount);
 using stored = dict.Item("counter");
-console.log("through the dictionary:", stored.Increment(10));
+console.log("through the dictionary:", await stored.Increment(10));
 void connection;

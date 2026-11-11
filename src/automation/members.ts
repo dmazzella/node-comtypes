@@ -2,8 +2,8 @@ import * as ctypes from "node-ctypes";
 import { COMError } from "../errors.ts";
 import type { InterfacePointer } from "../interface.ts";
 import { ITypeInfo, ELEMDESC, FUNCDESC, TYPEATTR, VARDESC } from "../interfaces/typeinfo.ts";
-import { takeBSTR } from "../low-level/native.ts";
-import { COMPointer } from "../pointer.ts";
+import { copyStruct, takeBSTR } from "../low-level/native.ts";
+import { COMPointer, sync } from "../pointer.ts";
 import { INVOKE_FUNC, INVOKE_PROPERTYGET, INVOKE_PROPERTYPUT, INVOKE_PROPERTYPUTREF, MEMBERID_NIL, PARAMFLAG_FHASDEFAULT, PARAMFLAG_FLCID, PARAMFLAG_FOPT, PARAMFLAG_FRETVAL, VAR_DISPATCH } from "./constants.ts";
 import type { DispatchPointer } from "./dispatch.ts";
 import { defaultLCID } from "./dispatch.ts";
@@ -26,10 +26,10 @@ export interface MemberInfo {
 export function dispatchTypeInfo(dispatch: DispatchPointer, lcid = defaultLCID): TypeInfoPointer | null {
   try {
     const count = new ctypes.c_uint32();
-    dispatch.GetTypeInfoCount(ctypes.byref(count));
+    sync(dispatch).GetTypeInfoCount(ctypes.byref(count));
     if (!count.value) return null;
     const out = new ctypes.c_void_p();
-    dispatch.GetTypeInfo(0, lcid, ctypes.byref(out));
+    sync(dispatch).GetTypeInfo(0, lcid, ctypes.byref(out));
     return out.value ? COMPointer.fromAddress(out.value, ITypeInfo) : null;
   } catch (error) {
     if (error instanceof COMError) return null;
@@ -40,31 +40,31 @@ export function dispatchTypeInfo(dispatch: DispatchPointer, lcid = defaultLCID):
 /** Run `use` with the TYPEATTR of `typeInfo`, released afterwards. */
 export function withTypeAttr<T>(typeInfo: TypeInfoPointer, use: (attr: TYPEATTR) => T): T {
   const out = new ctypes.c_void_p();
-  typeInfo.GetTypeAttr(ctypes.byref(out));
+  sync(typeInfo).GetTypeAttr(ctypes.byref(out));
   try {
-    return use(TYPEATTR.from_address(out.value!));
+    return use(copyStruct(TYPEATTR, out.value!));
   } finally {
-    typeInfo.ReleaseTypeAttr(out.value);
+    sync(typeInfo).ReleaseTypeAttr(out.value);
   }
 }
 
 export function withFuncDesc<T>(typeInfo: TypeInfoPointer, index: number, use: (desc: FUNCDESC) => T): T {
   const out = new ctypes.c_void_p();
-  typeInfo.GetFuncDesc(index, ctypes.byref(out));
+  sync(typeInfo).GetFuncDesc(index, ctypes.byref(out));
   try {
-    return use(FUNCDESC.from_address(out.value!));
+    return use(copyStruct(FUNCDESC, out.value!));
   } finally {
-    typeInfo.ReleaseFuncDesc(out.value);
+    sync(typeInfo).ReleaseFuncDesc(out.value);
   }
 }
 
 export function withVarDesc<T>(typeInfo: TypeInfoPointer, index: number, use: (desc: VARDESC) => T): T {
   const out = new ctypes.c_void_p();
-  typeInfo.GetVarDesc(index, ctypes.byref(out));
+  sync(typeInfo).GetVarDesc(index, ctypes.byref(out));
   try {
-    return use(VARDESC.from_address(out.value!));
+    return use(copyStruct(VARDESC, out.value!));
   } finally {
-    typeInfo.ReleaseVarDesc(out.value);
+    sync(typeInfo).ReleaseVarDesc(out.value);
   }
 }
 
@@ -75,20 +75,30 @@ export interface Documentation {
   readonly helpFile: string | null;
 }
 
+// Outputs of GetDocumentation, reused: the call is synchronous and cannot reenter.
+const documentationName = new ctypes.c_void_p();
+const documentationDoc = new ctypes.c_void_p();
+const documentationContext = new ctypes.c_uint32();
+const documentationFile = new ctypes.c_void_p();
+const documentationNameRef = ctypes.byref(documentationName);
+const documentationDocRef = ctypes.byref(documentationDoc);
+const documentationContextRef = ctypes.byref(documentationContext);
+const documentationFileRef = ctypes.byref(documentationFile);
+
 /** `ITypeInfo::GetDocumentation`; `MEMBERID_NIL` documents the type itself. */
 export function documentation(typeInfo: TypeInfoPointer, memid = MEMBERID_NIL): Documentation {
-  const name = new ctypes.c_void_p();
-  const doc = new ctypes.c_void_p();
-  const context = new ctypes.c_uint32();
-  const file = new ctypes.c_void_p();
-  typeInfo.GetDocumentation(memid, ctypes.byref(name), ctypes.byref(doc), ctypes.byref(context), ctypes.byref(file));
-  return { name: takeBSTR(name.value), docString: takeBSTR(doc.value), helpContext: context.value, helpFile: takeBSTR(file.value) };
+  documentationName.value = null;
+  documentationDoc.value = null;
+  documentationContext.value = 0;
+  documentationFile.value = null;
+  sync(typeInfo).GetDocumentation(memid, documentationNameRef, documentationDocRef, documentationContextRef, documentationFileRef);
+  return { name: takeBSTR(documentationName.value), docString: takeBSTR(documentationDoc.value), helpContext: documentationContext.value, helpFile: takeBSTR(documentationFile.value) };
 }
 
 /** Parameter flags of a FUNCDESC. */
 export function parameterFlags(desc: FUNCDESC): number[] {
   const size = ctypes.sizeof(ELEMDESC);
-  return Array.from({ length: desc.cParams }, (_, index) => ELEMDESC.from_address(desc.lprgelemdescParam! + BigInt(index * size)).paramdesc.wParamFlags);
+  return Array.from({ length: desc.cParams }, (_, index) => copyStruct(ELEMDESC, desc.lprgelemdescParam! + BigInt(index * size)).paramdesc.wParamFlags);
 }
 
 interface MutableMember {
@@ -144,8 +154,8 @@ function collect(typeInfo: TypeInfoPointer, members: Map<number, MutableMember>,
     const reference = new ctypes.c_uint32();
     const base = new ctypes.c_void_p();
     try {
-      typeInfo.GetRefTypeOfImplType(index, ctypes.byref(reference));
-      typeInfo.GetRefTypeInfo(reference.value, ctypes.byref(base));
+      sync(typeInfo).GetRefTypeOfImplType(index, ctypes.byref(reference));
+      sync(typeInfo).GetRefTypeInfo(reference.value, ctypes.byref(base));
     } catch {
       continue;
     }

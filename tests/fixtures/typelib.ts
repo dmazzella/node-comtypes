@@ -7,6 +7,7 @@ import * as ctypes from "node-ctypes";
 import {
   CC_STDCALL,
   COMPointer,
+  sync,
   ELEMDESC,
   FUNCDESC,
   FUNC_PUREVIRTUAL,
@@ -33,7 +34,7 @@ import {
   createTypeLib,
   loadTypeLib,
 } from "@node-ctypes/comtypes";
-import type { InterfacePointer } from "@node-ctypes/comtypes";
+import type { SyncPointer } from "@node-ctypes/comtypes";
 
 const POINTER_SIZE = ctypes.sizeof(ctypes.c_void_p);
 
@@ -74,7 +75,8 @@ function describe(desc: TYPEDESC, vt: number, pointer = false): Buffer[] {
   return [target._buffer];
 }
 
-function addFunctions(info: InterfacePointer<typeof import("@node-ctypes/comtypes").ICreateTypeInfo>, functions: readonly Func[], firstSlot: number): void {
+// The builder runs synchronously: its calls go through sync() views.
+function addFunctions(info: SyncPointer<typeof import("@node-ctypes/comtypes").ICreateTypeInfo>, functions: readonly Func[], firstSlot: number): void {
   functions.forEach((func, index) => {
     const keep: Buffer[] = [];
     const params = Buffer.alloc(ctypes.sizeof(ELEMDESC) * Math.max(1, func.params.length));
@@ -103,19 +105,19 @@ function addFunctions(info: InterfacePointer<typeof import("@node-ctypes/comtype
 
 /** Write the test type library to `file`. */
 export function buildTestTypeLib(file: string, ids: TestTypeLibIds): void {
-  using stdole = loadTypeLib("stdole2.tlb");
+  using stdole = sync(loadTypeLib("stdole2.tlb"));
   const typeInfoOf = (iid: GUID) => {
     const out = new ctypes.c_void_p();
     stdole.GetTypeInfoOfGuid(iid, ctypes.byref(out));
     return COMPointer.fromAddress(out.value!, ITypeInfo);
   };
-  using library = createTypeLib(file);
+  using library = sync(createTypeLib(file));
   library.SetName("NodeComtypesTest");
   library.SetGuid(ids.libid);
   library.SetVersion(1, 0);
   library.SetLcid(0);
 
-  using counter = library.CreateTypeInfo("ICounter", TKIND_INTERFACE)!;
+  using counter = sync(library.CreateTypeInfo("ICounter", TKIND_INTERFACE)!);
   counter.SetGuid(ids.counter);
   counter.SetTypeFlags(TYPEFLAG_FOLEAUTOMATION);
   using unknownInfo = typeInfoOf(IUnknown.iid);
@@ -130,7 +132,7 @@ export function buildTestTypeLib(file: string, ids: TestTypeLibIds): void {
   );
   counter.LayOut();
 
-  using greeter = library.CreateTypeInfo("IGreeter", TKIND_INTERFACE)!;
+  using greeter = sync(library.CreateTypeInfo("IGreeter", TKIND_INTERFACE)!);
   greeter.SetGuid(ids.greeter);
   greeter.SetTypeFlags(TYPEFLAG_FDUAL | TYPEFLAG_FOLEAUTOMATION);
   using dispatchInfo = typeInfoOf(IDispatch.iid);
@@ -145,7 +147,7 @@ export function buildTestTypeLib(file: string, ids: TestTypeLibIds): void {
   );
   greeter.LayOut();
 
-  using coclass = library.CreateTypeInfo("Greeter", TKIND_COCLASS)!;
+  using coclass = sync(library.CreateTypeInfo("Greeter", TKIND_COCLASS)!);
   coclass.SetGuid(ids.clsid);
   coclass.SetTypeFlags(TYPEFLAG_FCANCREATE);
   using greeterInfo = greeter.QueryInterface(ITypeInfo);

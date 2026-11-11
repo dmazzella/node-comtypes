@@ -5,7 +5,7 @@ import { GUID, toGUID } from "../guid.ts";
 import type { GUIDLike } from "../guid.ts";
 import { COMInterface, HRESULT, STDMETHOD } from "../interface.ts";
 import type { InterfaceDef, InterfacePointer } from "../interface.ts";
-import { COMPointer } from "../pointer.ts";
+import { COMPointer, sync } from "../pointer.ts";
 import { IUnknown } from "./unknown.ts";
 
 const { POINTER, c_void_p } = ctypes;
@@ -28,6 +28,6 @@ export function queryService<T extends InterfaceDef<any>>(object: COMPointer | C
   using pointer = COMPointer.fromAddress(borrowed.address, borrowed.interface, { addRef: true });
   using provider = pointer.QueryInterface(IServiceProvider);
   const out = new ctypes.c_void_p();
-  provider.QueryService(toGUID(service), iface.iid, ctypes.byref(out));
+  sync(provider).QueryService(toGUID(service), iface.iid, ctypes.byref(out));
   return COMPointer.fromAddress(out.value!, iface) as InterfacePointer<T>;
 }

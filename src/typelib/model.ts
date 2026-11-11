@@ -35,10 +35,12 @@ import { documentation, withFuncDesc, withTypeAttr, withVarDesc } from "../autom
 import { ErrorValue, readVariant } from "../automation/variant.ts";
 import type { MethodKind } from "../interface.ts";
 import { ELEMDESC, ITypeInfo, ITypeLib, PARAMDESCEX, TYPEDESC } from "../interfaces/typeinfo.ts";
-import { POINTER_SIZE, readMemory, takeBSTR } from "../low-level/native.ts";
-import { COMPointer } from "../pointer.ts";
+import { copyStruct, POINTER_SIZE, readMemory, takeBSTR } from "../low-level/native.ts";
+import { COMPointer, sync } from "../pointer.ts";
 import { withLibAttr } from "./load.ts";
 import type { TypeInfoPointer, TypeLibPointer } from "./load.ts";
+import { runSync } from "./steps.ts";
+import type { Steps } from "./steps.ts";
 
 // A serializable description of a type library: the input of GetModule's
 // runtime construction and of the code generator.
@@ -171,6 +173,12 @@ interface Context {
   readonly libid: string;
   /** External libraries by LIBID. */
   readonly libraries: Map<string, string>;
+  /**
+   * References to user types, by the address of the referenced ITypeInfo: the
+   * same types are referenced by many members. The pointers are held until the
+   * end of the read, so an address cannot be reused by another object.
+   */
+  readonly userTypes: Map<bigint, { readonly pointer: TypeInfoPointer; readonly type: TypeRef }>;
 }
 
 function encodeDefault(value: unknown): DefaultValue | undefined {
@@ -185,7 +193,7 @@ function encodeDefault(value: unknown): DefaultValue | undefined {
 function containingLibrary(info: TypeInfoPointer, context: Context): { libid: string; name: string } {
   const out = new ctypes.c_void_p();
   const index = new ctypes.c_uint32();
-  info.GetContainingTypeLib(ctypes.byref(out), ctypes.byref(index));
+  sync(info).GetContainingTypeLib(ctypes.byref(out), ctypes.byref(index));
   using library = COMPointer.fromAddress(out.value!, ITypeLib);
   const libid = withLibAttr(library, (attr) => attr.guid.toString());
   let name = context.libraries.get(libid);
@@ -201,27 +209,27 @@ function libraryDocumentation(library: TypeLibPointer): { name: string | null; d
   const doc = new ctypes.c_void_p();
   const context = new ctypes.c_uint32();
   const file = new ctypes.c_void_p();
-  library.GetDocumentation(MEMBERID_NIL, ctypes.byref(name), ctypes.byref(doc), ctypes.byref(context), ctypes.byref(file));
+  sync(library).GetDocumentation(MEMBERID_NIL, ctypes.byref(name), ctypes.byref(doc), ctypes.byref(context), ctypes.byref(file));
   takeBSTR(file.value);
   return { name: takeBSTR(name.value), doc: takeBSTR(doc.value) };
 }
 
 function refTypeInfo(info: TypeInfoPointer, hreftype: number): TypeInfoPointer {
   const out = new ctypes.c_void_p();
-  info.GetRefTypeInfo(hreftype, ctypes.byref(out));
+  sync(info).GetRefTypeInfo(hreftype, ctypes.byref(out));
   return COMPointer.fromAddress(out.value!, ITypeInfo);
 }
 
 function readTypeDesc(info: TypeInfoPointer, desc: TYPEDESC, context: Context): TypeRef {
   switch (desc.vt) {
     case VT_PTR:
-      return { kind: "ptr", to: readTypeDesc(info, TYPEDESC.from_address(desc.lptdesc!), context) };
+      return { kind: "ptr", to: readTypeDesc(info, copyStruct(TYPEDESC, desc.lptdesc!), context) };
     case VT_SAFEARRAY:
-      return { kind: "safearray", of: readTypeDesc(info, TYPEDESC.from_address(desc.lptdesc!), context) };
+      return { kind: "safearray", of: readTypeDesc(info, copyStruct(TYPEDESC, desc.lptdesc!), context) };
     case VT_CARRAY: {
       // ARRAYDESC { TYPEDESC tdescElem; USHORT cDims; SAFEARRAYBOUND rgbounds[cDims]; }
       const address = desc.lptdesc!;
-      const element = TYPEDESC.from_address(address);
+      const element = copyStruct(TYPEDESC, address);
       const count = ctypes.readValue(address + BigInt(SIZEOF_TYPEDESC), ctypes.c_uint16);
       const bounds = SIZEOF_TYPEDESC + 4;
       const dims = Array.from({ length: count }, (_, index) => ctypes.readValue(address + BigInt(bounds + index * 8), ctypes.c_uint32));
@@ -235,7 +243,24 @@ function readTypeDesc(info: TypeInfoPointer, desc: TYPEDESC, context: Context): 
 }
 
 function userType(info: TypeInfoPointer, hreftype: number, context: Context): TypeRef {
-  using referenced = refTypeInfo(info, hreftype);
+  const referenced = refTypeInfo(info, hreftype);
+  const cached = context.userTypes.get(referenced.address);
+  if (cached) {
+    referenced.Release();
+    return cached.type;
+  }
+  let type: TypeRef;
+  try {
+    type = describeUserType(referenced, hreftype, context);
+  } catch (error) {
+    referenced.Release();
+    throw error;
+  }
+  context.userTypes.set(referenced.address, { pointer: referenced, type });
+  return type;
+}
+
+function describeUserType(referenced: TypeInfoPointer, hreftype: number, context: Context): TypeRef {
   const name = documentation(referenced).name ?? `Type${hreftype}`;
   const library = containingLibrary(referenced, context);
   const external = library.libid !== context.libid;
@@ -256,7 +281,7 @@ function userType(info: TypeInfoPointer, hreftype: number, context: Context): Ty
 function memberNames(info: TypeInfoPointer, memid: number, count: number): string[] {
   const names = Buffer.alloc(POINTER_SIZE * count);
   const found = new ctypes.c_uint32();
-  info.GetNames(memid, names, count, ctypes.byref(found));
+  sync(info).GetNames(memid, names, count, ctypes.byref(found));
   return Array.from({ length: found.value }, (_, index) => takeBSTR(ctypes.readValue(names, ctypes.c_void_p, index * POINTER_SIZE)) ?? "");
 }
 
@@ -270,11 +295,11 @@ function readFunctions(info: TypeInfoPointer, count: number, context: Context): 
         const names = memberNames(info, desc.memid, desc.cParams + 1);
         const elementSize = ctypes.sizeof(ELEMDESC);
         const params = Array.from({ length: desc.cParams }, (_, position): ParamModel => {
-          const element = ELEMDESC.from_address(desc.lprgelemdescParam! + BigInt(position * elementSize));
+          const element = copyStruct(ELEMDESC, desc.lprgelemdescParam! + BigInt(position * elementSize));
           const flags = element.paramdesc.wParamFlags;
           const param: ParamModel = { name: names[position + 1] || (position === desc.cParams - 1 && desc.invkind & (INVOKE_PROPERTYPUT | INVOKE_PROPERTYPUTREF) ? "value" : `arg${position}`), type: readTypeDesc(info, element.tdesc, context), flags };
           if (flags & PARAMFLAG_FHASDEFAULT && element.paramdesc.pparamdescex) {
-            const value = encodeDefault(readVariant(PARAMDESCEX.from_address(element.paramdesc.pparamdescex).varDefaultValue._buffer));
+            const value = encodeDefault(readVariant(copyStruct(PARAMDESCEX, element.paramdesc.pparamdescex).varDefaultValue._buffer));
             if (value !== undefined) return { ...param, default: value };
           }
           return param;
@@ -302,8 +327,8 @@ function implementedTypes(info: TypeInfoPointer, count: number, context: Context
   return Array.from({ length: count }, (_, index) => {
     const reference = new ctypes.c_uint32();
     const flags = new ctypes.c_int32();
-    info.GetRefTypeOfImplType(index, ctypes.byref(reference));
-    info.GetImplTypeFlags(index, ctypes.byref(flags));
+    sync(info).GetRefTypeOfImplType(index, ctypes.byref(reference));
+    sync(info).GetImplTypeFlags(index, ctypes.byref(flags));
     return { type: userType(info, reference.value, context), flags: flags.value };
   });
 }
@@ -357,7 +382,7 @@ function readType(info: TypeInfoPointer, context: Context): TypeModel | null {
       if (attr.flags & TYPEFLAG_FDUAL) {
         // Dual: describe the vtable interface (implemented type -1).
         const reference = new ctypes.c_uint32();
-        info.GetRefTypeOfImplType(-1 >>> 0, ctypes.byref(reference));
+        sync(info).GetRefTypeOfImplType(-1 >>> 0, ctypes.byref(reference));
         using vtable = refTypeInfo(info, reference.value);
         const model = readType(vtable, context);
         return model && model.kind === "interface" ? { ...model, dual: true, doc: model.doc ?? docString } : model;
@@ -396,22 +421,36 @@ function readType(info: TypeInfoPointer, context: Context): TypeModel | null {
 
 /** Describe a loaded type library. */
 export function readTypeLib(library: TypeLibPointer): TypeLibModel {
+  return runSync(readTypeLibSteps(library));
+}
+
+/** {@link readTypeLib} in steps: yields after each type. */
+export function* readTypeLibSteps(library: TypeLibPointer): Steps<TypeLibModel> {
   const attributes = withLibAttr(library, (attr) => ({ libid: attr.guid.toString(), major: attr.wMajorVerNum, minor: attr.wMinorVerNum, lcid: attr.lcid, syskind: attr.syskind }));
   const { name, doc } = libraryDocumentation(library);
-  const context: Context = { libid: attributes.libid, libraries: new Map([[attributes.libid, name ?? attributes.libid]]) };
+  const context: Context = { libid: attributes.libid, libraries: new Map([[attributes.libid, name ?? attributes.libid]]), userTypes: new Map() };
   const types: TypeModel[] = [];
   const seen = new Set<string>();
-  const count = library.GetTypeInfoCount();
-  for (let index = 0; index < count; index++) {
-    const out = new ctypes.c_void_p();
-    library.GetTypeInfo(index, ctypes.byref(out));
-    using info = COMPointer.fromAddress(out.value!, ITypeInfo);
-    const type = readType(info, context);
-    if (!type) continue;
-    const key = "iid" in type ? `${type.kind === "dispinterface" ? "D" : "I"}${type.iid}` : `${type.kind}:${type.name}`;
-    if (seen.has(key) || ("iid" in type && seen.has(`I${type.iid}`))) continue;
-    seen.add(key);
-    types.push(type);
+  try {
+    const count = sync(library).GetTypeInfoCount();
+    for (let index = 0; index < count; index++) {
+      const out = new ctypes.c_void_p();
+      sync(library).GetTypeInfo(index, ctypes.byref(out));
+      {
+        using info = COMPointer.fromAddress(out.value!, ITypeInfo);
+        const type = readType(info, context);
+        if (type) {
+          const key = "iid" in type ? `${type.kind === "dispinterface" ? "D" : "I"}${type.iid}` : `${type.kind}:${type.name}`;
+          if (!seen.has(key) && !("iid" in type && seen.has(`I${type.iid}`))) {
+            seen.add(key);
+            types.push(type);
+          }
+        }
+      }
+      yield;
+    }
+  } finally {
+    for (const { pointer } of context.userTypes.values()) pointer.Release();
   }
   return { name: name ?? attributes.libid, doc, ...attributes, types };
 }

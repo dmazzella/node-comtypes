@@ -9,15 +9,15 @@ const skip = process.platform !== "win32" && "COM requires Windows";
 const nameOf = (object: unknown) => (object as { interface?: InterfaceDef }).interface?.name;
 
 describe("GetBestInterface", { skip }, () => {
-  it("types objects from their type library by default", () => {
+  it("types objects from their type library by default", async () => {
     using _ = apartment();
-    const Scripting = GetModule("scrrun.dll");
-    using dict = CreateObject("Scripting.Dictionary");
+    const Scripting = await GetModule("scrrun.dll");
+    using dict = await CreateObject("Scripting.Dictionary");
     assert.equal(nameOf(dict), "IDictionary");
     assert.equal((dict as { interface?: InterfaceDef }).interface, Scripting.IDictionary);
     assert.equal(isDispatch(dict), false);
-    dict.Add("a", 1);
-    dict.Add("b", 2);
+    await dict.Add("a", 1);
+    await dict.Add("b", 2);
     assert.equal(dict.Count, 2);
     assert.equal(dict.Item("b"), 2);
     assert.deepEqual([...dict], ["a", "b"], "typed dispatch pointers iterate _NewEnum");
@@ -27,11 +27,11 @@ describe("GetBestInterface", { skip }, () => {
     assert.equal(dispatchPointer(dict), dict);
   });
 
-  it("keeps the dynamic client on request", () => {
+  it("keeps the dynamic client on request", async () => {
     using _ = apartment();
-    using dict = CreateObject("Scripting.Dictionary", { dynamic: true });
+    using dict = await CreateObject("Scripting.Dictionary", { dynamic: true });
     assert.equal(isDispatch(dict), true);
-    using typed = CreateObject("Scripting.Dictionary", { interface: IDispatch });
+    using typed = await CreateObject("Scripting.Dictionary", { interface: IDispatch });
     assert.equal(nameOf(typed), "IDispatch");
   });
 
@@ -49,12 +49,12 @@ describe("GetBestInterface", { skip }, () => {
     assert.equal(getLivePointerCount(), before);
   });
 
-  it("converts IDispatch results of typed calls (wrap_outparam)", () => {
+  it("converts IDispatch results of typed calls (wrap_outparam)", async () => {
     using _ = apartment();
-    using outer = CreateObject("Scripting.Dictionary");
-    using inner = CreateObject("Scripting.Dictionary");
-    inner.Add("x", 1);
-    outer.Add("typed", inner);
+    using outer = await CreateObject("Scripting.Dictionary");
+    using inner = await CreateObject("Scripting.Dictionary");
+    await inner.Add("x", 1);
+    await outer.Add("typed", inner);
     // A VARIANT holding an object with type information: its best interface.
     using back = outer.Item("typed");
     assert.equal(nameOf(back), "IDictionary");
@@ -67,26 +67,26 @@ describe("GetBestInterface", { skip }, () => {
         return value * 2;
       }
     }
-    outer.Add("plain", new Plain());
+    await outer.Add("plain", new Plain());
     using plain = outer.Item("plain");
     assert.equal(isDispatch(plain), true);
-    assert.equal(plain.Twice(21), 42);
+    assert.equal(await plain.Twice(21), 42);
     // A method declared to return IDispatch (IShellDispatch::Windows).
-    using shell = CreateObject("Shell.Application");
-    using windows = shell.Windows();
+    using shell = await CreateObject("Shell.Application");
+    using windows = await shell.Windows();
     assert.equal(nameOf(windows), "IShellWindows");
     assert.equal(typeof windows.Count, "number");
   });
 
-  it("types objects returned by GetObject", () => {
+  it("types objects returned by GetObject", async () => {
     using _ = apartment();
-    using wmi = GetObject("winmgmts:");
+    using wmi = await GetObject("winmgmts:");
     assert.equal(nameOf(wmi), "ISWbemServicesEx");
     // WMI class properties are not in the type library: ISWbemObject.Properties_ reads them.
-    for (const system of wmi.ExecQuery("SELECT Caption FROM Win32_OperatingSystem")) {
+    for (const system of await wmi.ExecQuery("SELECT Caption FROM Win32_OperatingSystem")) {
       using owned = system;
       assert.equal(nameOf(owned), "ISWbemObjectEx");
-      using property = owned.Properties_.Item("Caption");
+      using property = await owned.Properties_.Item("Caption");
       assert.match(property.Value, /Windows/);
     }
   });

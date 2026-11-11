@@ -14,7 +14,7 @@ import { GUIDKIND_DEFAULT_SOURCE_DISP_IID, IConnectionPointContainer, IProvideCl
 import { IDispatch } from "../interfaces/dispatch.ts";
 import { IProvideClassInfo, ITypeInfo, ITypeLib } from "../interfaces/typeinfo.ts";
 import { IUnknown } from "../interfaces/unknown.ts";
-import { COMPointer } from "../pointer.ts";
+import { COMPointer, sync } from "../pointer.ts";
 import type { InvokeArguments } from "../server/automation.ts";
 import { COMObject } from "../server/comobject.ts";
 
@@ -44,7 +44,7 @@ function sourcePointer(source: unknown): COMPointer {
 
 function typeInfoFromReference(typeInfo: TypeInfoPointer, reference: number): TypeInfoPointer {
   const out = new ctypes.c_void_p();
-  typeInfo.GetRefTypeInfo(reference, ctypes.byref(out));
+  sync(typeInfo).GetRefTypeInfo(reference, ctypes.byref(out));
   return COMPointer.fromAddress(out.value!, ITypeInfo);
 }
 
@@ -53,10 +53,10 @@ function defaultSourceOf(coclass: TypeInfoPointer): TypeInfoPointer | null {
   const count = withTypeAttr(coclass, (attr) => attr.cImplTypes);
   for (let index = 0; index < count; index++) {
     const flags = new ctypes.c_int32();
-    coclass.GetImplTypeFlags(index, ctypes.byref(flags));
+    sync(coclass).GetImplTypeFlags(index, ctypes.byref(flags));
     if ((flags.value & (IMPLTYPEFLAG_FDEFAULT | IMPLTYPEFLAG_FSOURCE)) !== (IMPLTYPEFLAG_FDEFAULT | IMPLTYPEFLAG_FSOURCE)) continue;
     const reference = new ctypes.c_uint32();
-    coclass.GetRefTypeOfImplType(index, ctypes.byref(reference));
+    sync(coclass).GetRefTypeOfImplType(index, ctypes.byref(reference));
     return typeInfoFromReference(coclass, reference.value);
   }
   return null;
@@ -75,7 +75,7 @@ function eventTypeInfo(source: COMPointer, iid: GUID | null): TypeInfoPointer | 
   const provider = source.tryQueryInterface(IProvideClassInfo);
   if (provider) {
     using owned = provider;
-    using coclass = attempt(() => owned.GetClassInfo());
+    using coclass = attempt(() => sync(owned).GetClassInfo());
     if (coclass) {
       const fromCoclass = attempt(() => defaultSourceOf(coclass));
       if (fromCoclass && (!iid || withTypeAttr(fromCoclass, (attr) => attr.guid.equals(iid)))) return fromCoclass;
@@ -97,10 +97,10 @@ function eventTypeInfo(source: COMPointer, iid: GUID | null): TypeInfoPointer | 
 function typeInfoInLibrary(typeInfo: TypeInfoPointer, iid: GUID): TypeInfoPointer {
   const library = new ctypes.c_void_p();
   const index = new ctypes.c_uint32();
-  typeInfo.GetContainingTypeLib(ctypes.byref(library), ctypes.byref(index));
+  sync(typeInfo).GetContainingTypeLib(ctypes.byref(library), ctypes.byref(index));
   using typeLib = COMPointer.fromAddress(library.value!, ITypeLib);
   const out = new ctypes.c_void_p();
-  typeLib.GetTypeInfoOfGuid(iid, ctypes.byref(out));
+  sync(typeLib).GetTypeInfoOfGuid(iid, ctypes.byref(out));
   return COMPointer.fromAddress(out.value!, ITypeInfo);
 }
 
@@ -123,7 +123,7 @@ function resolveInterface(source: COMPointer, option: GetEventsOptions["interfac
     const provider = source.tryQueryInterface(IProvideClassInfo2);
     if (provider) {
       using owned = provider;
-      iid = attempt(() => owned.GetGUID(GUIDKIND_DEFAULT_SOURCE_DISP_IID));
+      iid = attempt(() => sync(owned).GetGUID(GUIDKIND_DEFAULT_SOURCE_DISP_IID));
     }
   }
   using typeInfo = eventTypeInfo(source, iid);
@@ -204,13 +204,13 @@ export function GetEvents(source: unknown, handler: object, options: GetEventsOp
   using pointer = sourcePointer(source);
   const { definition, names } = resolveInterface(pointer, options.interface);
   using container = pointer.QueryInterface(IConnectionPointContainer);
-  const point = container.FindConnectionPoint(definition.iid);
+  const point = sync(container).FindConnectionPoint(definition.iid);
   if (!point) throw new COMError(E_NOINTERFACE, { text: "FindConnectionPoint returned NULL" });
   const Sink = sinkClassFor(definition);
   const sink = new Sink(handler as Handler, names);
   let cookie: number;
   try {
-    cookie = point.Advise(sink);
+    cookie = sync(point).Advise(sink);
   } catch (error) {
     point.Release();
     throw error;
@@ -220,7 +220,7 @@ export function GetEvents(source: unknown, handler: object, options: GetEventsOp
     if (!connected) return;
     connected = false;
     try {
-      point.Unadvise(cookie);
+      sync(point).Unadvise(cookie);
     } finally {
       point.Release();
     }

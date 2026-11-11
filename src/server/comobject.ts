@@ -17,7 +17,7 @@ import { IDispatch, IEnumVARIANT } from "../interfaces/dispatch.ts";
 import { ISupportErrorInfo } from "../interfaces/errorinfo.ts";
 import { IUnknown } from "../interfaces/unknown.ts";
 import { POINTER_SIZE, readMemory, writeMemory } from "../low-level/native.ts";
-import { COMPointer } from "../pointer.ts";
+import { COMPointer, setLocalThreading, sync } from "../pointer.ts";
 import { ReturnHRESULT, dispatchGetIDsOfNames, dispatchInvoke, defaultIdsOfNames, defaultInvoke } from "./automation.ts";
 import type { InvokeArguments } from "./automation.ts";
 import { setErrorInfo } from "./errorinfo.ts";
@@ -395,7 +395,7 @@ export class COMObject {
 
   /** Lends the first interface (`borrowReference`), e.g. to pass the object as an argument. */
   [comReference](): BorrowedReference {
-    return { address: this.#state.addresses[0], interface: this.#state.info.interfaces[0] };
+    return { address: this.#state.addresses[0], interface: this.#state.info.interfaces[0], threading: this.#state.info.threading };
   }
 
   /** Called when the native reference count drops to zero. Python: `_final_release_`. */
@@ -562,7 +562,7 @@ function typeInfoFor(guid: InterfaceDef<any> | GUID, location: TypeLibLocation):
       typeLibraries.set(key, library);
     }
     const out = new ctypes.c_void_p();
-    library.GetTypeInfoOfGuid(guid instanceof GUID ? guid : guid.iid, ctypes.byref(out));
+    sync(library).GetTypeInfoOfGuid(guid instanceof GUID ? guid : guid.iid, ctypes.byref(out));
     return out.value;
   } catch {
     return null;
@@ -702,3 +702,10 @@ export class ClassFactory extends COMObject {
     return S_OK;
   }
 }
+
+// Asynchronous calls on objects implemented here follow their threading model
+// (see pointer.ts): "apartment" objects are called on the home thread.
+setLocalThreading((address) => {
+  const object = instances.get(address)?.object.deref();
+  return object ? (object[comReference]().threading ?? "apartment") : null;
+});

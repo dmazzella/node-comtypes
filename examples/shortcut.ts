@@ -1,4 +1,5 @@
 // Create a Windows shortcut with IShellLinkW + IPersistFile and read it back.
+// The shell link is created on the COM executor: its methods run there.
 //
 //   npm run build && node examples/shortcut.ts
 
@@ -6,30 +7,30 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { create_unicode_buffer } from "node-ctypes";
-import { CLSID_ShellLink, CoCreateInstance, IPersistFile, IShellLinkW, STGM_READ, apartment } from "@node-ctypes/comtypes";
+import { CreateObject, IPersistFile, STGM_READ, ShellLink, apartment } from "@node-ctypes/comtypes";
 
 const path = join(tmpdir(), "node-comtypes-notepad.lnk");
 
 using _ = apartment();
 
 {
-  using link = CoCreateInstance(CLSID_ShellLink, IShellLinkW);
-  link.SetPath("C:\\Windows\\notepad.exe");
-  link.SetDescription("Notepad — created by node-comtypes");
-  link.SetWorkingDirectory("C:\\Windows");
+  using link = await CreateObject(ShellLink); // IShellLinkW
+  await link.SetPath("C:\\Windows\\notepad.exe");
+  await link.SetDescription("Notepad — created by node-comtypes");
+  await link.SetWorkingDirectory("C:\\Windows");
   using file = link.QueryInterface(IPersistFile);
-  file.Save(path, 1);
+  await file.Save(path, 1);
   console.log(`Saved ${path}`);
 }
 
 {
-  using link = CoCreateInstance(CLSID_ShellLink, IShellLinkW);
+  using link = await CreateObject(ShellLink);
   using file = link.QueryInterface(IPersistFile);
-  file.Load(path, STGM_READ);
+  await file.Load(path, STGM_READ);
   const text = create_unicode_buffer(1024);
-  link.GetPath(text, 1024, null, 0);
+  await link.GetPath(text, 1024, null, 0);
   console.log(`Target:      ${text.value}`);
-  link.GetDescription(text, 1024);
+  await link.GetDescription(text, 1024);
   console.log(`Description: ${text.value}`);
 }
 

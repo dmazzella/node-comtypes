@@ -14,7 +14,7 @@ if (data.token) {
   object = table.getDispatch(data.cookie!);
 }
 try {
-  const result = { apartment: getApartmentType()?.name, sum: object.Add(20, 22), owner: object.ThreadId, worker: threadId, echo: object.Echo(["a", 1]) };
+  const result = { apartment: getApartmentType()?.name, sum: await object.Add(20, 22), owner: object.ThreadId, worker: threadId, echo: await object.Echo(["a", 1]) };
   parentPort!.postMessage(result);
 } finally {
   object[Symbol.dispose]();

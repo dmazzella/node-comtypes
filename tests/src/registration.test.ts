@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { COMError, CreateObject, E_NOINTERFACE, dispatchPointer, GUID, GetModule, apartment, isCoClass, registerTypeLib, registeredTypeLibPath, registeredVersions, unregisterTypeLib } from "@node-ctypes/comtypes";
+import { COMError, CreateObject, E_NOINTERFACE, dispatchPointer, finalize, GUID, GetModule, apartment, isCoClass, registerTypeLib, registeredTypeLibPath, registeredVersions, stats, unregisterTypeLib } from "@node-ctypes/comtypes";
 import type { InterfaceDef } from "@node-ctypes/comtypes";
 import { HKEY_CURRENT_USER, readString } from "@node-ctypes/comtypes/low-level";
 import { buildTestTypeLib } from "../fixtures/typelib.ts";
@@ -29,11 +29,11 @@ function build(ids: TestTypeLibIds): string {
 }
 
 describe("type library creation and registration", { skip }, () => {
-  it("builds a type library with ICreateTypeLib2 and reads it back", () => {
+  it("builds a type library with ICreateTypeLib2 and reads it back", async () => {
     const ids = newIds();
     const file = build(ids);
     using _ = apartment();
-    const Test = GetModule(file);
+    const Test = await GetModule(file);
     const counter = Test.ICounter as InterfaceDef;
     const greeter = Test.IGreeter as InterfaceDef;
     assert.equal(counter.iid.toString(), ids.counter);
@@ -67,7 +67,7 @@ describe("LocalServer32 registered with UseCommandLine", { skip }, () => {
   const server = fileURLToPath(new URL("../fixtures/typedserver.ts", import.meta.url));
   const run = (file: string, ids: TestTypeLibIds, ...args: string[]) => execFileSync(process.execPath, [server, file, ids.clsid, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 
-  it("prints the usage without a switch", () => {
+  it("prints the usage without a switch", async () => {
     const script = "const { UseCommandLine } = await import('@node-ctypes/comtypes/server'); process.exitCode = (await UseCommandLine([], { argv: [] })) ? 0 : 3;";
     assert.throws(
       () => execFileSync(process.execPath, ["--input-type=module", "-e", script], { stdio: "pipe" }),
@@ -91,17 +91,23 @@ describe("LocalServer32 registered with UseCommandLine", { skip }, () => {
       assert.ok(GUID.fromProgID("NodeComtypesTest.Greeter").equals(ids.clsid));
 
       using _ = apartment();
-      const Test = GetModule(file);
+      const Test = await GetModule(file);
       // Default: the best interface, from the coclass of the server (IProvideClassInfo).
-      using greeter = CreateObject("NodeComtypesTest.Greeter");
+      using greeter = await CreateObject("NodeComtypesTest.Greeter");
       assert.equal((greeter as { interface?: InterfaceDef }).interface, Test.IGreeter);
-      const greeting: string = greeter.Greet("node");
+      // A proxy of a single-threaded home: called on the executor through its own reference (GIT).
+      const before = stats();
+      const greeting: string = await greeter.Greet("node");
+      assert.ok(stats().generation !== before.generation || stats().completed > before.completed, "called on the executor");
       pid = Number(/from (\d+)/.exec(greeting)?.[1]);
       assert.ok(pid > 0 && pid !== process.pid, "served by another process");
       assert.equal(greeter.Count, 1);
       // ICounter is a custom (non-dispatch) interface: its proxy comes from the registered type library.
-      using counter = greeter.QueryInterface(Test.ICounter as InterfaceDef) as unknown as Disposable & { Add(a: number, b: number): number; Name: string };
-      assert.equal(counter.Add(2, 40), 42);
+      using counter = greeter.QueryInterface(Test.ICounter as InterfaceDef) as unknown as Disposable & { Add(a: number, b: number): Promise<number>; Name: string };
+      assert.equal(await counter.Add(2, 40), 42);
+      // A new executor: the proxies are fetched again from the Global Interface Table.
+      await finalize();
+      assert.equal(await counter.Add(1, 1), 2);
       assert.equal(counter.Name, `counter ${pid}`);
     } finally {
       run(file, ids, "/unregserver");
@@ -121,16 +127,16 @@ describe("LocalServer32 registered with UseCommandLine", { skip }, () => {
     assert.equal(alive(), false, "the server exits once its objects are released");
   });
 
-  it("cannot marshal custom interfaces without the type library registration", () => {
+  it("cannot marshal custom interfaces without the type library registration", async () => {
     const ids = newIds();
     const file = build(ids);
     run(file, ids, "/regserver");
     try {
       using _ = apartment();
-      const Test = GetModule(file);
+      const Test = await GetModule(file);
       unregisterTypeLib({ libid: ids.libid, major: 1, minor: 0, lcid: 0 });
-      using greeter = CreateObject(ids.clsid, { dynamic: true });
-      assert.match(greeter.Greet("node"), /^Hello, node/, "IDispatch is marshaled by the system");
+      using greeter = await CreateObject(ids.clsid, { dynamic: true });
+      assert.match(await greeter.Greet("node"), /^Hello, node/, "IDispatch is marshaled by the system");
       assert.throws(
         () => dispatchPointer(greeter).QueryInterface(Test.ICounter as InterfaceDef),
         (error: unknown) => error instanceof COMError && error.hresult === E_NOINTERFACE,

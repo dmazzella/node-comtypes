@@ -39,9 +39,9 @@ const skip = process.platform !== "win32" && "COM requires Windows";
 const CLSID_WebBrowser = new GUID("{8856F961-340A-11D0-A96B-00C04FD705A2}");
 
 describe("Constants", { skip }, () => {
-  it("exposes enum members, enums and module constants of the type library", () => {
+  it("exposes enum members, enums and module constants of the type library", async () => {
     using _ = apartment();
-    using fso = CreateObject("Scripting.FileSystemObject");
+    using fso = await CreateObject("Scripting.FileSystemObject");
     const c = Constants(fso);
     assert.equal(c.TemporaryFolder, 2);
     assert.equal(c.SpecialFolderConst.TemporaryFolder, 2);
@@ -49,9 +49,9 @@ describe("Constants", { skip }, () => {
     assert.ok("TristateTrue" in c);
     assert.throws(() => c.NoSuchConstant, /Scripting has no constant or enum NoSuchConstant/);
     assert.equal(c.then, undefined, "not thenable");
-    using dynamic = CreateObject("Scripting.Dictionary", { dynamic: true });
+    using dynamic = await CreateObject("Scripting.Dictionary", { dynamic: true });
     assert.equal(Constants(dynamic), c, "cached per type library");
-    using temp = fso.GetSpecialFolder(c.TemporaryFolder);
+    using temp = await fso.GetSpecialFolder(c.TemporaryFolder);
     assert.ok(temp.Path.length > 0);
   });
 });
@@ -73,41 +73,41 @@ describe("comtypes.persist", { skip }, () => {
     }
   }
 
-  it("IPersistPropertyBag loads from and saves to a JavaScript IPropertyBag (WebBrowser control)", () => {
+  it("IPersistPropertyBag loads from and saves to a JavaScript IPropertyBag (WebBrowser control)", async () => {
     using _ = apartment();
     using browser = CoCreateInstance(CLSID_WebBrowser, IUnknown);
     using persist = browser.QueryInterface(IPersistPropertyBag);
-    assert.ok(persist.GetClassID().equals(CLSID_WebBrowser));
+    assert.ok((await persist.GetClassID()).equals(CLSID_WebBrowser));
     const bag = new Bag();
-    persist.Load(bag, null);
+    await persist.Load(bag, null);
     assert.ok(bag.reads.includes("ExtentX") && bag.reads.includes("Height"), "the control reads its properties");
     bag.values.clear();
-    persist.Save(bag, 1, 1);
+    await persist.Save(bag, 1, 1);
     assert.equal(bag.values.get("ExtentX"), 5000, "Write receives the VARIANT* value");
     assert.equal(bag.values.get("ExtentY"), 3000);
   });
 
-  it("IPropertyBag calls round-trip through a JavaScript implementation", () => {
+  it("IPropertyBag calls round-trip through a JavaScript implementation", async () => {
     using _ = apartment();
     using bag = new Bag().QueryInterface(IPropertyBag);
-    bag.Write("Name", "value");
-    assert.equal(bag.Read("Name", undefined, null), "value");
-    assert.equal(bag.Read("Missing", 42, null), 42, "[in, out]: the initial value");
+    await bag.Write("Name", "value");
+    assert.equal(await bag.Read("Name", undefined, null), "value");
+    assert.equal(await bag.Read("Missing", 42, null), 42, "[in, out]: the initial value");
   });
 });
 
 describe("IViewObject2", { skip }, () => {
-  it("returns the extent as a SIZEL", () => {
+  it("returns the extent as a SIZEL", async () => {
     using _ = apartment();
     using browser = CoCreateInstance(CLSID_WebBrowser, IUnknown);
     using view = browser.QueryInterface(IViewObject2);
-    const extent = view.GetExtent(DVASPECT_CONTENT, -1, null);
+    const extent = await view.GetExtent(DVASPECT_CONTENT, -1, null);
     assert.ok(extent instanceof SIZEL);
     // Same result through a raw definition of the slot.
     const Raw = COMInterface({ name: "IViewObject2Raw", iid: IViewObject2.iid, extends: IViewObject, register: false, methods: [STDMETHOD(HRESULT, "GetExtent", [ctypes.c_uint32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p])] });
     using raw = browser.QueryInterface(Raw);
     const size = Buffer.alloc(8, 0x7f);
-    raw.GetExtent(DVASPECT_CONTENT, -1, null, size);
+    await raw.GetExtent(DVASPECT_CONTENT, -1, null, size);
     assert.deepEqual([extent.cx, extent.cy], [size.readInt32LE(0), size.readInt32LE(4)]);
   });
 });
@@ -133,11 +133,11 @@ describe("IServiceProvider", { skip }, () => {
     }
   }
 
-  it("queryService returns the service as the requested interface", () => {
+  it("queryService returns the service as the requested interface", async () => {
     using _ = apartment();
     const provider = new Provider();
     using service = queryService(provider, SID_Test, IDispatch);
-    assert.equal(Dispatch(service).Answer(), 42);
+    assert.equal(await Dispatch(service).Answer(), 42);
     assert.throws(
       () => queryService(provider, "{0E8C5A20-0000-4000-8000-000000000002}", IDispatch),
       (error: unknown) => error instanceof COMError && error.hresult === E_NOINTERFACE,
@@ -149,17 +149,17 @@ describe("IServiceProvider", { skip }, () => {
 });
 
 describe("comtypes.shelllink", { skip }, () => {
-  it("ShellLink is a coclass with IShellLinkW and IShellLinkA", () => {
+  it("ShellLink is a coclass with IShellLinkW and IShellLinkA", async () => {
     using _ = apartment();
-    using link = CreateObject(ShellLink);
+    using link = await CreateObject(ShellLink);
     assert.equal(link.interface, IShellLinkW);
     using ansi = link.QueryInterface(IShellLinkA);
-    ansi.SetPath("C:\\Windows\\notepad.exe");
+    await ansi.SetPath("C:\\Windows\\notepad.exe");
     const wide = ctypes.create_unicode_buffer(260);
-    link.GetPath(wide, 260, null, 0);
+    await link.GetPath(wide, 260, null, 0);
     assert.equal(wide.value.toLowerCase(), "c:\\windows\\notepad.exe");
     const narrow = ctypes.create_string_buffer(260);
-    ansi.GetPath(narrow, 260, null, 0);
+    await ansi.GetPath(narrow, 260, null, 0);
     assert.equal(narrow.value.toString().toLowerCase(), "c:\\windows\\notepad.exe");
   });
 });
@@ -182,30 +182,24 @@ describe("ReturnHRESULT", { skip }, () => {
     }
   }
 
-  it("returns success codes and failures without onError", () => {
+  it("returns success codes and failures without onError", async () => {
     using _ = apartment();
     Checker.errors = [];
     using checker = new Checker().QueryInterface(IChecker);
-    assert.equal(checker.Check(1), 0);
-    assert.equal(checker.Check(0), S_FALSE);
-    assert.throws(
-      () => checker.Check(-1),
-      (error: unknown) => error instanceof COMError && error.hresult === E_ACCESSDENIED && error.details?.description === "negative values are not allowed",
-    );
+    assert.equal(await checker.Check(1), 0);
+    assert.equal(await checker.Check(0), S_FALSE);
+    await assert.rejects(checker.Check(-1), (error: unknown) => error instanceof COMError && error.hresult === E_ACCESSDENIED && error.details?.description === "negative values are not allowed");
     assert.deepEqual(Checker.errors, []);
-    assert.throws(() => checker.Check(101), COMError);
+    await assert.rejects(checker.Check(101), COMError);
     assert.equal(Checker.errors.length, 1, "other exceptions still reach onError");
   });
 
-  it("fills EXCEPINFO through IDispatch", () => {
+  it("fills EXCEPINFO through IDispatch", async () => {
     using _ = apartment();
     Checker.errors = [];
     using dynamic = Dispatch(new Checker());
-    assert.equal(dynamic.Check(0), undefined);
-    assert.throws(
-      () => dynamic.Check(-1),
-      (error: unknown) => error instanceof COMError && error.hresult === DISP_E_EXCEPTION && error.details?.scode === E_ACCESSDENIED && error.details.description === "negative values are not allowed",
-    );
+    assert.equal(await dynamic.Check(0), undefined);
+    await assert.rejects(dynamic.Check(-1), (error: unknown) => error instanceof COMError && error.hresult === DISP_E_EXCEPTION && error.details?.scode === E_ACCESSDENIED && error.details.description === "negative values are not allowed");
     assert.deepEqual(Checker.errors, []);
   });
 });

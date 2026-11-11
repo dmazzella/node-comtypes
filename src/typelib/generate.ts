@@ -46,7 +46,7 @@ class Writer {
   /** Definition (interface, record class, coclass) -> export name. */
   readonly names = new Map<unknown, string>();
   /** node-comtypes names imported as types (aliased with `$`). */
-  readonly imports = new Set<string>(["InterfaceDef", "InterfaceMethods", "InterfacePointer", "ComObject"]);
+  readonly imports = new Set<string>(["InterfaceDef", "InterfaceMethods", "InterfacePointer", "SyncInterfaceMethods", "ComObject"]);
 
   constructor(model: TypeLibModel) {
     this.model = model;
@@ -157,20 +157,23 @@ class Writer {
     return outputs.length === 1 ? outputs[0] : `[${outputs.join(", ")}]`;
   }
 
-  signature(spec: MethodSpec, self: InterfaceDef<any>): string {
+  /** Signature of a member; methods (kind `method`) return promises unless `synchronous`. */
+  signature(spec: MethodSpec, self: InterfaceDef<any>, synchronous = true): string {
     const params = (spec as MethodSpec & { readonly params?: readonly ParamInfo[] }).params;
-    if (!params) return "(...args: unknown[]): number";
-    return `(${this.parameters(params, self)}): ${this.result(spec, self)}`;
+    const result = params ? this.result(spec, self) : "number";
+    const returned = synchronous || spec.kind !== "method" ? result : `Promise<${result}>`;
+    return params ? `(${this.parameters(params, self)}): ${returned}` : `(...args: unknown[]): ${returned}`;
   }
 
-  interfaceBody(definition: InterfaceDef<any>): string[] {
+  /** Members as installed on pointers (`synchronous`: on the `sync()` views). */
+  interfaceBody(definition: InterfaceDef<any>, synchronous: boolean): string[] {
     const ownDisp = definition.dispMethods.slice(definition.base?.dispMethods.length ?? 0);
     const members = [...definition.methods, ...ownDisp];
     const lines: string[] = [];
     const memberNames = new Set<string>();
     for (const spec of members) {
       memberNames.add(spec.name);
-      lines.push(`  ${key(spec.name)}${this.signature(spec, definition)};`);
+      lines.push(`  ${key(spec.name)}${this.signature(spec, definition, synchronous)};`);
       if (spec.dispatch && spec.kind === "propget" && spec.writable) {
         memberNames.add(`_set_${spec.property}`);
         lines.push(`  ${key(`_set_${spec.property}`)}(value: ${this.valueType((spec as MethodSpec & { readonly valueType: ComParamType }).valueType, "in", definition)}): undefined;`);
@@ -264,15 +267,20 @@ class Writer {
             body.push(`export const ${name} = module$[${JSON.stringify(type.name)}] as typeof ${this.use(builtin.name)};`, "");
             break;
           }
-          const lines = this.interfaceBody(definition);
           const own = [...new Set([...definition.methods, ...definition.dispMethods].map((spec) => [spec.name, spec.property]).flat())];
-          const base = definition.base ? `Omit<InterfaceMethods$<${this.interfaceType(definition.base)}>, ${own.length ? own.map((member) => JSON.stringify(member)).join(" | ") : "never"}>` : "{}";
+          const omitted = own.length ? own.map((member) => JSON.stringify(member)).join(" | ") : "never";
+          const base = definition.base ? `Omit<InterfaceMethods$<${this.interfaceType(definition.base)}>, ${omitted}>` : "{}";
+          const syncBase = definition.base ? `Omit<SyncInterfaceMethods$<${this.interfaceType(definition.base)}>, ${omitted}>` : "{}";
           body.push(
             `/** ${type.doc ?? `${type.kind === "dispinterface" ? "Dispinterface" : "Interface"} ${type.name}`} (${definition.iid}) */`,
             `export interface ${name}Methods extends ${base} {`,
-            ...lines,
+            ...this.interfaceBody(definition, false),
             `}`,
-            `export const ${name} = module$[${JSON.stringify(type.name)}] as InterfaceDef$<${name}Methods>;`,
+            `/** ${type.name} members on the \`sync()\` views: every method synchronous. */`,
+            `export interface ${name}SyncMethods extends ${syncBase} {`,
+            ...this.interfaceBody(definition, true),
+            `}`,
+            `export const ${name} = module$[${JSON.stringify(type.name)}] as InterfaceDef$<${name}Methods, ${name}SyncMethods>;`,
             "",
           );
           break;
@@ -309,7 +317,7 @@ class Writer {
       const name = exportName(type.name);
       if (!name) continue;
       const isInterface = typeof value === "object" && value !== null && "Pointer" in value;
-      body.push(`export const ${name} = ${target};`, isInterface ? `export type ${name}Methods = ${target}Methods;` : `export type ${name} = ${target};`, "");
+      body.push(`export const ${name} = ${target};`, ...(isInterface ? [`export type ${name}Methods = ${target}Methods;`, `export type ${name}SyncMethods = ${target}SyncMethods;`] : [`export type ${name} = ${target};`]), "");
     }
     const typeImports = [...this.imports, "TypeLibModel", "TypeLibModule"].sort().map((name) => `${name} as ${name}$`);
     const header = [

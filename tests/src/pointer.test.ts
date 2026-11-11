@@ -48,7 +48,7 @@ function refCount(pointer: COMPointer): number {
 }
 
 describe("COMPointer", { skip }, () => {
-  it("QueryInterface returns typed, owned pointers", () => {
+  it("QueryInterface returns typed, owned pointers", async () => {
     using _ = apartment();
     using link = CoCreateInstance(CLSID_ShellLink, IShellLinkW);
     using file = link.QueryInterface(IPersistFile);
@@ -56,9 +56,9 @@ describe("COMPointer", { skip }, () => {
     assert.ok(file instanceof IPersist.Pointer);
     assert.ok(file instanceof COMPointer);
     assert.equal(file.interface, IPersistFile);
-    const clsid: GUID = file.GetClassID();
+    const clsid: GUID = await file.GetClassID();
     assert.ok(clsid.equals(CLSID_ShellLink));
-    assert.equal(file.IsDirty(), 1, "S_FALSE is returned, not thrown");
+    assert.equal(await file.IsDirty(), 1, "S_FALSE is returned, not thrown");
   });
 
   it("QueryInterface throws COMError and tryQueryInterface returns null", () => {
@@ -112,18 +112,18 @@ describe("COMPointer", { skip }, () => {
     assert.ok(adopted.isSameObject(borrowed));
   });
 
-  it("passes as a pointer argument through _as_parameter_", () => {
+  it("passes as a pointer argument through _as_parameter_", async () => {
     using _ = apartment();
     using source = createStream();
     using target = createStream();
     const data = Buffer.from("@node-ctypes/comtypes");
-    assert.equal(source.Write(data, data.length), data.length);
-    source.Seek(0n, STREAM_SEEK_SET);
+    assert.equal(await source.Write(data, data.length), data.length);
+    await source.Seek(0n, STREAM_SEEK_SET);
     // SELF parameter: the target stream is passed as an IStream*.
-    assert.deepEqual(source.CopyTo(target, BigInt(data.length)), [BigInt(data.length), BigInt(data.length)]);
-    target.Seek(0n);
+    assert.deepEqual(await source.CopyTo(target, BigInt(data.length)), [BigInt(data.length), BigInt(data.length)]);
+    await target.Seek(0n);
     const read = Buffer.alloc(data.length);
-    target.Read(read, read.length);
+    await target.Read(read, read.length);
     assert.deepEqual(read, data);
   });
 
@@ -137,31 +137,31 @@ describe("COMPointer", { skip }, () => {
 });
 
 describe("IStream", { skip }, () => {
-  it("writes, seeks, reads, stats and clones", () => {
+  it("writes, seeks, reads, stats and clones", async () => {
     using _ = apartment();
     using stream = createStream();
     const data = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
-    assert.equal(stream.Write(data, data.length), 8);
-    assert.equal(stream.Seek(2n, STREAM_SEEK_SET), 2n);
+    assert.equal(await stream.Write(data, data.length), 8);
+    assert.equal(await stream.Seek(2n, STREAM_SEEK_SET), 2n);
     const out = Buffer.alloc(4);
-    assert.equal(stream.Read(out, 4), 4);
+    assert.equal(await stream.Read(out, 4), 4);
     assert.deepEqual([...out], [3, 4, 5, 6]);
-    const stat: STATSTG = stream.Stat(STATFLAG_NONAME);
+    const stat: STATSTG = await stream.Stat(STATFLAG_NONAME);
     assert.ok(stat instanceof STATSTG);
     assert.equal(stat.type, STGTY_STREAM);
     assert.equal(stat.cbSize, 8n);
-    using clone = stream.Clone();
+    using clone = await stream.Clone();
     assert.ok(clone instanceof IStream.Pointer, "SELF out parameters are typed as the interface");
     using sequential = clone!.QueryInterface(ISequentialStream);
     const rest = Buffer.alloc(2);
-    assert.equal(sequential.Read(rest, 2), 2);
+    assert.equal(await sequential.Read(rest, 2), 2);
     assert.deepEqual([...rest], [7, 8]);
-    assert.equal(stream.Commit(), S_OK);
+    assert.equal(await stream.Commit(), S_OK);
   });
 });
 
 describe("error info", { skip }, () => {
-  it("takeErrorInfo reads and clears the thread error object", () => {
+  it("takeErrorInfo reads and clears the thread error object", async () => {
     using _ = apartment();
     const oleaut32 = new ctypes.WinDLL("oleaut32.dll");
     const CreateErrorInfo = oleaut32.func("CreateErrorInfo", ctypes.c_int32, [ctypes.c_void_p]);
@@ -169,10 +169,10 @@ describe("error info", { skip }, () => {
     const out = new ctypes.c_void_p();
     assert.equal(CreateErrorInfo(ctypes.byref(out)), S_OK);
     using create = COMPointer.fromAddress(out.value!, ICreateErrorInfo);
-    create.SetDescription("Something failed");
-    create.SetSource("NodeComtypes.Test");
-    create.SetHelpContext(42);
-    create.SetGUID(IStream.iid);
+    await create.SetDescription("Something failed");
+    await create.SetSource("NodeComtypes.Test");
+    await create.SetHelpContext(42);
+    await create.SetGUID(IStream.iid);
     using info = create.QueryInterface(IErrorInfo);
     assert.equal(SetErrorInfo(0, info), S_OK);
     const details = takeErrorInfo();

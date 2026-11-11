@@ -25,6 +25,7 @@ import {
   documentation,
   getLivePointerCount,
   named,
+  sync,
   withFuncDesc,
   withTypeAttr,
 } from "@node-ctypes/comtypes";
@@ -80,11 +81,13 @@ type Node = InterfacePointer<typeof IXMLDOMNode>;
 const NODE_ELEMENT = 1;
 const NODE_TEXT = 3;
 
-function documentNode(xml: string): { document: DispatchObject; root: Node } {
-  const document = CreateObject("MSXML2.DOMDocument.6.0", { dynamic: true });
+async function documentNode(xml: string): Promise<{ document: DispatchObject; root: Node }> {
+  const document = await CreateObject("MSXML2.DOMDocument.6.0", { dynamic: true });
   document.async = false;
-  assert.equal(document.loadXML(xml), true);
-  const root = dispatchPointer(document).QueryInterface(IXMLDOMNode).selectSingleNode("/*")!;
+  assert.equal(await document.loadXML(xml), true);
+  // Setup: the document element, read through a synchronous view.
+  using node = dispatchPointer(document).QueryInterface(IXMLDOMNode);
+  const root = sync(node).selectSingleNode("/*")!;
   return { document, root };
 }
 
@@ -93,8 +96,8 @@ function vtableLayout(typeInfo: InterfacePointer<typeof ITypeInfo>): Map<string,
   const layout = new Map<string, number>();
   const reference = new ctypes.c_uint32();
   const out = new ctypes.c_void_p();
-  typeInfo.GetRefTypeOfImplType(-1 >>> 0, ctypes.byref(reference));
-  typeInfo.GetRefTypeInfo(reference.value, ctypes.byref(out));
+  sync(typeInfo).GetRefTypeOfImplType(-1 >>> 0, ctypes.byref(reference));
+  sync(typeInfo).GetRefTypeInfo(reference.value, ctypes.byref(out));
   let current: InterfacePointer<typeof ITypeInfo> | null = COMPointer.fromAddress(out.value!, ITypeInfo);
   while (current) {
     using info = current;
@@ -106,8 +109,8 @@ function vtableLayout(typeInfo: InterfacePointer<typeof ITypeInfo>): Map<string,
     if (implemented) {
       const base = new ctypes.c_uint32();
       const next = new ctypes.c_void_p();
-      info.GetRefTypeOfImplType(0, ctypes.byref(base));
-      info.GetRefTypeInfo(base.value, ctypes.byref(next));
+      sync(info).GetRefTypeOfImplType(0, ctypes.byref(base));
+      sync(info).GetRefTypeInfo(base.value, ctypes.byref(next));
       current = COMPointer.fromAddress(next.value!, ITypeInfo);
     }
   }
@@ -166,9 +169,9 @@ describe("COMMETHOD definitions", () => {
 });
 
 describe("COMMETHOD calls", { skip }, () => {
-  it("declares IXMLDOMNode in the order of its type information", () => {
+  it("declares IXMLDOMNode in the order of its type information", async () => {
     using _ = apartment();
-    using document = CreateObject("MSXML2.DOMDocument.6.0");
+    using document = await CreateObject("MSXML2.DOMDocument.6.0");
     using typeInfo = dispatchTypeInfo(dispatchPointer(document))!;
     const layout = vtableLayout(typeInfo);
     const kinds = { method: INVOKE_FUNC, propget: INVOKE_PROPERTYGET, propput: INVOKE_PROPERTYPUT, propputref: 8 };
@@ -177,16 +180,16 @@ describe("COMMETHOD calls", { skip }, () => {
     }
   });
 
-  it("converts BSTR, VARIANT, VARIANT_BOOL and interface results", () => {
+  it("converts BSTR, VARIANT, VARIANT_BOOL and interface results", async () => {
     using _ = apartment();
-    const { document, root } = documentNode("<root a='1'><child>text</child><child>two</child></root>");
+    const { document, root } = await documentNode("<root a='1'><child>text</child><child>two</child></root>");
     using __ = document;
     using rootNode = root;
     assert.equal(rootNode.nodeName, "root");
     assert.equal(rootNode._get_nodeName(), "root");
     assert.equal(rootNode.nodeType, NODE_ELEMENT);
     assert.equal(rootNode.nodeTypeString, "element");
-    assert.equal(rootNode.hasChildNodes(), true);
+    assert.equal(await rootNode.hasChildNodes(), true);
     assert.equal(rootNode.nodeValue, null, "elements have a VT_NULL node value");
     using first = rootNode.firstChild!;
     assert.ok(first instanceof IXMLDOMNode.Pointer);
@@ -206,64 +209,58 @@ describe("COMMETHOD calls", { skip }, () => {
     assert.equal(replaced.nodeValue, "set through propput");
   });
 
-  it("passes interfaces in and returns them, by position or by name", () => {
+  it("passes interfaces in and returns them, by position or by name", async () => {
     using _ = apartment();
-    const { document, root } = documentNode("<root><a/></root>");
+    const { document, root } = await documentNode("<root><a/></root>");
     using __ = document;
     using rootNode = root;
-    using a = rootNode.selectSingleNode("a")!;
-    using clone = a.cloneNode(true)!;
-    using appended = rootNode.appendChild(clone)!;
+    using a = (await rootNode.selectSingleNode("a"))!;
+    using clone = (await a.cloneNode(true))!;
+    using appended = (await rootNode.appendChild(clone))!;
     assert.ok(appended.isSameObject(clone));
-    using fresh = a.cloneNode(false)!;
+    using fresh = (await a.cloneNode(false))!;
     // Optional VARIANT omitted: VT_ERROR/DISP_E_PARAMNOTFOUND appends at the end.
-    using inserted = rootNode.insertBefore(fresh)!;
+    using inserted = (await rootNode.insertBefore(fresh))!;
     assert.ok(inserted.isSameObject(fresh));
-    using another = a.cloneNode(false)!;
-    using before = (rootNode.insertBefore as (...args: unknown[]) => Node)(named({ newChild: another, refChild: a }));
+    using another = (await a.cloneNode(false))!;
+    using before = await (rootNode.insertBefore as (...args: unknown[]) => Promise<Node>)(named({ newChild: another, refChild: a }));
     assert.ok(before.isSameObject(another));
     assert.equal(rootNode.xml, "<root><a/><a/><a/><a/></root>");
-    using removed = rootNode.removeChild(a)!;
+    using removed = (await rootNode.removeChild(a))!;
     assert.ok(removed.isSameObject(a));
     // Dynamic objects are accepted for interface parameters (QueryInterface to IXMLDOMNode).
-    using created = document.createElement("dynamic");
-    using appendedDynamic = rootNode.appendChild(created)!;
+    using created = await document.createElement("dynamic");
+    using appendedDynamic = (await rootNode.appendChild(created))!;
     assert.equal(appendedDynamic.nodeName, "dynamic");
   });
 
-  it("validates arguments before calling", () => {
+  it("validates arguments before calling", async () => {
     using _ = apartment();
-    const { document, root } = documentNode("<root/>");
+    const { document, root } = await documentNode("<root/>");
     using __ = document;
     using rootNode = root;
-    const untyped = rootNode as unknown as Record<string, (...args: unknown[]) => unknown>;
-    assert.throws(() => untyped.selectSingleNode(), /missing argument queryString/);
-    assert.throws(() => untyped.selectSingleNode("a", "b"), /at most 1 arguments/);
-    assert.throws(() => untyped.selectSingleNode(named({ nope: 1 })), /unknown argument/);
-    assert.throws(() => untyped.appendChild(42), /Expected a COM object/);
+    const untyped = rootNode as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    await assert.rejects(untyped.selectSingleNode(), /missing argument queryString/);
+    await assert.rejects(untyped.selectSingleNode("a", "b"), /at most 1 arguments/);
+    await assert.rejects(untyped.selectSingleNode(named({ nope: 1 })), /unknown argument/);
+    await assert.rejects(untyped.appendChild(42), /Expected a COM object/);
   });
 
-  it("raises COMError and frees outputs on failure", () => {
+  it("raises COMError and frees outputs on failure", async () => {
     using _ = apartment();
-    const { document, root } = documentNode("<root/>");
+    const { document, root } = await documentNode("<root/>");
     using __ = document;
     using rootNode = root;
     const before = getLivePointerCount();
-    assert.throws(
-      () => rootNode.selectSingleNode("///"),
-      (error: unknown) => error instanceof COMError && error.method === "IXMLDOMNode::selectSingleNode" && error.hresult < 0,
-    );
+    await assert.rejects(rootNode.selectSingleNode("///"), (error: unknown) => error instanceof COMError && error.method === "IXMLDOMNode::selectSingleNode" && error.hresult < 0);
     // MSXML reports the reason through IErrorInfo.
-    assert.throws(
-      () => rootNode.appendChild(rootNode),
-      (error: unknown) => error instanceof COMError && error.hresult < 0 && typeof error.details?.description === "string",
-    );
+    await assert.rejects(rootNode.appendChild(rootNode), (error: unknown) => error instanceof COMError && error.hresult < 0 && typeof error.details?.description === "string");
     assert.equal(getLivePointerCount(), before);
   });
 
-  it("does not leak interface results", () => {
+  it("does not leak interface results", async () => {
     using _ = apartment();
-    const { document, root } = documentNode("<root><a>x</a></root>");
+    const { document, root } = await documentNode("<root><a>x</a></root>");
     using __ = document;
     using rootNode = root;
     const before = getLivePointerCount();
@@ -311,12 +308,14 @@ describe("COMMETHOD [in, out] and lcid parameters", { skip }, () => {
     const object = Buffer.alloc(pointerSize);
     ctypes.writeValue(object, ctypes.c_void_p, ctypes.addressof(vtable));
     try {
+      // A single-threaded home: this object (plain callbacks, neither agile nor a proxy) is called on it.
+      using _ = apartment();
       using pointer = COMPointer.fromAddress(ctypes.addressof(object), ITwice);
-      assert.deepEqual(pointer.Twice(21, "ab"), [42, "abab", 0]);
+      assert.deepEqual(await pointer.Twice(21, "ab"), [42, "abab", 0]);
       setDefaultLCID(0x409);
       try {
         // named() is runtime-only: the static signature is positional.
-        assert.deepEqual((pointer.Twice as (...args: unknown[]) => unknown)(named({ text: "x", number: -1 })), [-2, "xx", 0x409]);
+        assert.deepEqual(await (pointer.Twice as (...args: unknown[]) => Promise<unknown>)(named({ text: "x", number: -1 })), [-2, "xx", 0x409]);
       } finally {
         setDefaultLCID(0);
       }
@@ -329,7 +328,7 @@ describe("COMMETHOD [in, out] and lcid parameters", { skip }, () => {
 });
 
 describe("COMMETHOD POINTER(T) parameters", { skip }, () => {
-  it("pass node-ctypes arrays as raw pointers", () => {
+  it("pass node-ctypes arrays as raw pointers", async () => {
     using _ = apartment();
     const ISum = COMInterface({
       name: "ISum",
@@ -351,9 +350,9 @@ describe("COMMETHOD POINTER(T) parameters", { skip }, () => {
     // A node-ctypes array is passed as its address,
     // not copied into a temporary c_int32.
     const values = ctypes.array(ctypes.c_int32, 3)(1, 2, 39);
-    assert.equal(sum.Sum(values, 3), 42);
+    assert.equal(await sum.Sum(values, 3), 42);
     assert.equal(object.received, ctypes.addressof(values));
     // A plain number still goes through a temporary.
-    assert.equal(sum.Sum(7, 1), 7);
+    assert.equal(await sum.Sum(7, 1), 7);
   });
 });

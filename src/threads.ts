@@ -12,7 +12,7 @@ import { IDispatch } from "./interfaces/dispatch.ts";
 import { IUnknown } from "./interfaces/unknown.ts";
 import { ole32 } from "./low-level/native.ts";
 import { rawRelease } from "./low-level/vtable.ts";
-import { COMPointer } from "./pointer.ts";
+import { COMPointer, sync } from "./pointer.ts";
 import { CoCreateInstance } from "./runtime.ts";
 
 // COM pointers belong to their apartment: other threads (worker_threads, each
@@ -102,13 +102,13 @@ export class GlobalInterfaceTable implements Disposable {
   /** Register `object` (as `iface`, default its own interface); returns the cookie, valid in every thread. */
   register(object: COMPointer | ComObject, iface?: InterfaceDef<any>): number {
     const { iid } = source(object);
-    return this.#table.RegisterInterfaceInGlobal(object, iface?.iid ?? iid);
+    return sync(this.#table).RegisterInterfaceInGlobal(object, iface?.iid ?? iid);
   }
 
   /** A pointer usable in the calling thread. */
   get<T extends InterfaceDef<any>>(cookie: number, iface: T): InterfacePointer<T> {
     const out = new ctypes.c_void_p();
-    this.#table.GetInterfaceFromGlobal(cookie, iface.iid._buffer, ctypes.byref(out));
+    sync(this.#table).GetInterfaceFromGlobal(cookie, iface.iid._buffer, ctypes.byref(out));
     return COMPointer.fromAddress(out.value!, iface) as InterfacePointer<T>;
   }
 
@@ -117,7 +117,7 @@ export class GlobalInterfaceTable implements Disposable {
   }
 
   revoke(cookie: number): void {
-    this.#table.RevokeInterfaceFromGlobal(cookie);
+    sync(this.#table).RevokeInterfaceFromGlobal(cookie);
   }
 
   [Symbol.dispose](): void {

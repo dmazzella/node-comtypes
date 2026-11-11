@@ -102,7 +102,9 @@ export function allocBSTR(text: string): bigint {
 /** Read a BSTR without freeing it (`null` for a NULL BSTR, which COM treats as ""). */
 export function readBSTR(bstr: bigint | null): string | null {
   if (!bstr) return null;
-  return readMemory(bstr, ctypes.readValue(bstr - 4n, c_uint32) & ~1).toString("utf16le");
+  // The length prefix counts bytes; embedded NULs are part of the string.
+  const length = (ctypes.readValue(bstr - 4n, c_uint32) as number) >>> 1;
+  return length ? (ctypes.wstring_at(bstr, length) ?? "") : "";
 }
 
 /** Read a BSTR and free it. */
@@ -113,6 +115,17 @@ export function takeBSTR(bstr: bigint | null): string | null {
   } finally {
     oleaut32().SysFreeString(bstr);
   }
+}
+
+/**
+ * A copy of the structure at `address`, for data that is only read (type
+ * descriptors): cheaper than a view over native memory (`from_address`).
+ * Pointers inside still refer to native memory.
+ */
+export function copyStruct<T>(type: new (...args: any[]) => T, address: bigint): T {
+  const bytes = Buffer.allocUnsafe(ctypes.sizeof(type as unknown as ctypes.FFIType));
+  ctypes.memmove(bytes, address, bytes.length);
+  return (type as unknown as { from_buffer(source: Buffer): T }).from_buffer(bytes);
 }
 
 /** Copy `size` bytes of native memory at `address`. */

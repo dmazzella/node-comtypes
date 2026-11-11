@@ -105,12 +105,17 @@ async function main(argv: readonly string[]): Promise<number> {
   }
 }
 
-main(process.argv.slice(2)).then(
-  (code) => {
-    process.exitCode = code;
-  },
-  (error: unknown) => {
-    console.error(error instanceof Error ? error.message : error);
-    process.exitCode = 1;
-  },
-);
+main(process.argv.slice(2))
+  .then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (error: unknown) => {
+      console.error(error instanceof Error ? error.message : error);
+      process.exitCode = 1;
+    },
+  )
+  // One more event loop turn before exiting: exiting right after the work
+  // (and CoUninitialize) races Node's teardown with tasks posted by V8's
+  // concurrent GC, and can abort with "!(handle->flags & UV_HANDLE_CLOSING)".
+  .then(() => new Promise((resolve) => setTimeout(resolve, 0)));

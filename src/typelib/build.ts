@@ -59,6 +59,9 @@ import { ITypeLib } from "../interfaces/typeinfo.ts";
 import type { InterfacePointer } from "../interface.ts";
 import type { CoClass, TypeLibLocation } from "./coclass.ts";
 import type { AliasModel, DefaultValue, DispInterfaceModel, FuncModel, InterfaceModel, ParamModel, RecordModel, TypeLibModel, TypeModel, TypeRef } from "./model.ts";
+import { sync } from "../pointer.ts";
+import { runSync } from "./steps.ts";
+import type { Steps } from "./steps.ts";
 
 /** Interfaces defined by node-comtypes, by IID: type libraries reuse them. */
 export const builtinInterfaceDefs: ReadonlyMap<string, { readonly name: string; readonly definition: InterfaceDef<any> }> = new Map(
@@ -144,7 +147,7 @@ function typeInfoAddress(location: TypeLibLocation, guid: string): bigint {
     libraries.set(key, library);
   }
   const out = new ctypes.c_void_p();
-  library.GetTypeInfoOfGuid(new GUID(guid), ctypes.byref(out));
+  sync(library).GetTypeInfoOfGuid(new GUID(guid), ctypes.byref(out));
   return out.value!;
 }
 
@@ -413,6 +416,11 @@ class Builder {
  * dispinterfaces (DISPMETHOD / DISPPROPERTY), coclasses and module constants.
  */
 export function buildModule(model: TypeLibModel, options: { readonly path?: string } = {}): TypeLibModule {
+  return runSync(buildModuleSteps(model, options));
+}
+
+/** {@link buildModule} in steps: yields after each type. */
+export function* buildModuleSteps(model: TypeLibModel, options: { readonly path?: string } = {}): Steps<TypeLibModule> {
   const location: TypeLibLocation = { libid: model.libid, major: model.major, minor: model.minor, lcid: model.lcid, ...(options.path ? { path: options.path } : {}) };
   const builder = new Builder(model, location);
   const { types: _types, ...library } = model;
@@ -440,6 +448,7 @@ export function buildModule(model: TypeLibModel, options: { readonly path?: stri
         for (const constant of type.constants) define(constant.name, decodeDefault(constant.value));
         break;
     }
+    yield;
   }
   // Aliases of local enums, records and interfaces name the same definition
   // (MIDL often names the enum itself __MIDL___MIDL_itf_...).

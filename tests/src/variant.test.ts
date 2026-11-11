@@ -113,13 +113,13 @@ describe("SAFEARRAY", { skip }, () => {
     assert.throws(() => new VARIANT(safeArray([[1, 2], [3]], { dimensions: 2 })), /rectangular/);
   });
 
-  it("reads arrays returned by automation objects", () => {
+  it("reads arrays returned by automation objects", async () => {
     using _ = apartment();
-    using dict = CreateObject("Scripting.Dictionary");
-    dict.Add("k1", [1, 2]);
-    dict.Add("k2", "v");
-    assert.deepEqual(dict.Keys(), ["k1", "k2"]);
-    assert.deepEqual(dict.Items(), [[1, 2], "v"]);
+    using dict = await CreateObject("Scripting.Dictionary");
+    await dict.Add("k1", [1, 2]);
+    await dict.Add("k2", "v");
+    assert.deepEqual(await dict.Keys(), ["k1", "k2"]);
+    assert.deepEqual(await dict.Items(), [[1, 2], "v"]);
   });
 });
 
@@ -144,9 +144,9 @@ describe("VARIANT native operations", { skip }, () => {
     assert.deepEqual(copy.value, ["a", ["b"]]);
   });
 
-  it("holds interface references", () => {
+  it("holds interface references", async () => {
     using _ = apartment();
-    using dict = CreateObject("Scripting.Dictionary");
+    using dict = await CreateObject("Scripting.Dictionary");
     const pointer = dispatchPointer(dict);
     const base = refCount(pointer);
     {
@@ -165,17 +165,17 @@ describe("VARIANT native operations", { skip }, () => {
     assert.equal(dispatch.vt, VT_DISPATCH);
   });
 
-  it("does not leak across many conversions", () => {
+  it("does not leak across many conversions", async () => {
     using _ = apartment();
     const baseline = getLivePointerCount();
     for (let i = 0; i < 500; i++) {
-      using dict = CreateObject("Scripting.Dictionary");
-      dict.Add("list", [i, "x", [i]]);
-      dict.Add("self", dict);
+      using dict = await CreateObject("Scripting.Dictionary");
+      await dict.Add("list", [i, "x", [i]]);
+      await dict.Add("self", dict);
       const self = dict.Item("self");
       assert.equal(self.Item("list")[0], i);
       self[Symbol.dispose]();
-      dict.RemoveAll();
+      await dict.RemoveAll();
     }
     assert.equal(getLivePointerCount(), baseline);
   });

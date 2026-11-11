@@ -4,9 +4,15 @@ export * from "./hresult.ts";
 export { COMError, checkHRESULT, hresultText, systemMessage } from "./errors.ts";
 export type { COMErrorDetails, COMErrorOptions } from "./errors.ts";
 export { takeErrorInfo } from "./errorinfo.ts";
+export { stats, finalize } from "./executor/executor.ts";
+export { run } from "./executor/operations.ts";
+export type { RunOptions } from "./executor/operations.ts";
+export type { ExecutorStats } from "./executor/executor.ts";
 export { COMInterface, STDMETHOD, HRESULT, findInterface, derivesFrom } from "./interface.ts";
 export type {
+  Asynchronous,
   DispatchCall,
+  DispatchCallAsync,
   InterfaceDef,
   ComInterfaceDef,
   InterfacePointer,
@@ -15,12 +21,18 @@ export type {
   MethodSpec,
   MethodKind,
   MethodMarshal,
+  MethodMarshalAsync,
   MethodFunction,
   MethodResult,
   MethodsOf,
+  NativeRunner,
   PropertiesOf,
   PointerClass,
   RawFunction,
+  SyncInterfaceMethods,
+  SyncMethodsOf,
+  SyncPointer,
+  Synchronous,
 } from "./interface.ts";
 export { COMMETHOD, BSTR, LPOLESTR, REFGUID, REFIID, REFCLSID, SAFEARRAY, SELF, DATE, CURRENCY, lazy, dispid, helpstring, classifyParamType, resolveParamInterface } from "./commethod.ts";
 export type {
@@ -66,4 +78,4 @@ export { marshalInterface, unmarshalInterface, unmarshalDispatch, releaseMarshal
 export type { MarshaledInterface } from "./threads.ts";
 export type { MessagePump } from "./pump.ts";
 
-export const version = "0.1.1";
+export const version = "0.2.0";

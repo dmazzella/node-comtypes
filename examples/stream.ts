@@ -19,17 +19,17 @@ function createStream() {
 using stream = createStream();
 
 const data = Buffer.from("Hello from COMMETHOD");
-console.log("written:", stream.Write(data, data.length)); // [out] ULONG* -> number
-console.log("position:", stream.Seek(0n, STREAM_SEEK_SET)); // [out] ULARGE_INTEGER* -> bigint
-console.log("size:", stream.Stat(STATFLAG_NONAME).cbSize); // [out] STATSTG* -> STATSTG
+console.log("written:", await stream.Write(data, data.length)); // [out] ULONG* -> number
+console.log("position:", await stream.Seek(0n, STREAM_SEEK_SET)); // [out] ULARGE_INTEGER* -> bigint
+console.log("size:", (await stream.Stat(STATFLAG_NONAME)).cbSize); // [out] STATSTG* -> STATSTG
 
 // [out] IStream** (SELF) -> IStream pointer: same data, its own seek position.
-using clone = stream.Clone()!;
-clone.Seek(11n, STREAM_SEEK_SET);
+using clone = (await stream.Clone())!;
+await clone.Seek(11n, STREAM_SEEK_SET);
 const tail = Buffer.alloc(9);
-clone.Read(tail, tail.length);
+await clone.Read(tail, tail.length);
 console.log("clone reads:", tail.toString());
 
 using target = createStream();
-const [read, written] = stream.CopyTo(target, BigInt(data.length)); // two [out] -> tuple
+const [read, written] = await stream.CopyTo(target, BigInt(data.length)); // two [out] -> tuple
 console.log("copied:", read, written);

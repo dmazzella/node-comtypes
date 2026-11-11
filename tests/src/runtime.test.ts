@@ -60,7 +60,7 @@ describe("apartment", { skip }, () => {
     assert.throws(() => CoInitializeEx(COINIT_MULTITHREADED), hresultOf(RPC_E_CHANGED_MODE));
   });
 
-  it("releases live pointers on the last CoUninitialize", () => {
+  it("releases live pointers on the last CoUninitialize", async () => {
     CoInitializeEx();
     const before = getLivePointerCount();
     const link = CoCreateInstance(CLSID_ShellLink, IShellLinkW);
@@ -69,7 +69,7 @@ describe("apartment", { skip }, () => {
     CoUninitialize();
     assert.equal(getLivePointerCount(), 0);
     assert.ok(link.released && unknown.released);
-    assert.throws(() => link.SetPath("x"), /released/);
+    await assert.rejects(link.SetPath("x"), /released/);
     assert.throws(() => link.address, /released/);
     link[Symbol.dispose]();
   });
@@ -84,10 +84,10 @@ describe("object creation", { skip }, () => {
     assert.ok(link.isSameObject(unknown));
   });
 
-  it("CoCreateInstance accepts GUID strings and options", () => {
+  it("CoCreateInstance accepts GUID strings and options", async () => {
     using _ = apartment();
     using link = CoCreateInstance(CLSID_ShellLink.toString(), IShellLinkW, { clsctx: CLSCTX_INPROC_SERVER });
-    assert.equal(link.SetPath("C:\\Windows"), S_OK);
+    assert.equal(await link.SetPath("C:\\Windows"), S_OK);
   });
 
   it("reports unregistered classes", () => {
@@ -95,19 +95,19 @@ describe("object creation", { skip }, () => {
     assert.throws(() => CoCreateInstance(GUID.createNew(), IUnknown), hresultOf(REGDB_E_CLASSNOTREG));
   });
 
-  it("CoCreateInstanceEx creates locally", () => {
+  it("CoCreateInstanceEx creates locally", async () => {
     using _ = apartment();
     using link = CoCreateInstanceEx(CLSID_ShellLink, IShellLinkW);
-    assert.equal(link.SetDescription("ex"), S_OK);
+    assert.equal(await link.SetDescription("ex"), S_OK);
   });
 
-  it("CoGetClassObject returns an IClassFactory", () => {
+  it("CoGetClassObject returns an IClassFactory", async () => {
     using _ = apartment();
     using factory = CoGetClassObject(CLSID_ShellLink, IClassFactory, { clsctx: CLSCTX_INPROC_SERVER });
     const out = new ctypes.c_void_p();
-    factory.CreateInstance(null, IShellLinkW.iid, ctypes.byref(out));
+    await factory.CreateInstance(null, IShellLinkW.iid, ctypes.byref(out));
     using link = COMPointer.fromAddress(out.value!, IShellLinkW);
-    assert.equal(link.SetArguments("--flag"), S_OK);
+    assert.equal(await link.SetArguments("--flag"), S_OK);
   });
 });
 

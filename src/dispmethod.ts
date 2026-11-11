@@ -1,5 +1,5 @@
 import { DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, VT_CY, VT_TYPEMASK } from "./automation/constants.ts";
-import { getIDsOfNames, invoke } from "./automation/dispatch.ts";
+import { getIDsOfNames, invoke, invokeAsync } from "./automation/dispatch.ts";
 import type { DispatchPointer } from "./automation/dispatch.ts";
 import { NamedArguments } from "./automation/named.ts";
 import { ByRef, Typed, borrowReference, safeArray, typed } from "./automation/variant.ts";
@@ -8,7 +8,8 @@ import type { ComParamType, DispIdFlag, IdlFlag, ParamFlag, ParamInfo, ParamKind
 import { COMError } from "./errors.ts";
 import { DISP_E_MEMBERNOTFOUND } from "./hresult.ts";
 import { derivesFrom } from "./interface.ts";
-import type { DispatchCall, InterfaceDef, MethodKind, MethodSpec } from "./interface.ts";
+import type { DispatchCall, DispatchCallAsync, InterfaceDef, MethodKind, MethodSpec } from "./interface.ts";
+import { linkOperation } from "./executor/operations.ts";
 import { COMPointer } from "./pointer.ts";
 
 type KindOf<I extends readonly IdlFlag[]> = "propget" extends I[number] ? "propget" : "propput" extends I[number] ? "propput" : "propputref" extends I[number] ? "propputref" : "method";
@@ -83,11 +84,19 @@ function isObject(value: unknown): boolean {
   return borrowReference(value) !== null;
 }
 
-function makeCall(member: string, dispid: number, kind: MethodKind, infos: readonly ParamInfo[], valueType: ComParamType | null): DispatchCall {
+/** Synchronous and asynchronous calls of a dispatch member. */
+interface DispatchCalls {
+  readonly call: DispatchCall;
+  /** For methods: `IDispatch::Invoke` on the COM executor. */
+  readonly callAsync: DispatchCallAsync;
+}
+
+function makeCall(member: string, dispid: number, kind: MethodKind, infos: readonly ParamInfo[], valueType: ComParamType | null): DispatchCalls {
   const kinds = infos.map((info) => classifyParamType(info.type));
   const resultKind = valueType === null ? null : classifyParamType(valueType);
   const inputs = infos.filter((info) => info.input);
-  return (pointer, args, self, put) => {
+  // Converts the arguments: positional values with declared types and defaults, named arguments.
+  const convert = (pointer: COMPointer, args: readonly unknown[], put: boolean | undefined) => {
     let positional = [...args];
     let named: { dispids: number[]; values: unknown[] } | undefined;
     const last = positional[positional.length - 1];
@@ -111,6 +120,10 @@ function makeCall(member: string, dispid: number, kind: MethodKind, infos: reado
       if (info.hasDefault) converted[index] = info.defaultValue;
       else if (!info.optional && !named) throw new TypeError(`${member}: missing argument ${info.name}`);
     }
+    return { converted, named, writing };
+  };
+  const call: DispatchCall = (pointer, args, self, put) => {
+    const { converted, named, writing } = convert(pointer, args, put);
     const dispatch = pointer as DispatchPointer;
     if (writing) {
       const value = converted[converted.length - 1];
@@ -127,6 +140,21 @@ function makeCall(member: string, dispid: number, kind: MethodKind, infos: reado
     const value = invoke(dispatch, dispid, flags, converted, { named, name: member });
     return valueType === null ? undefined : wrapOutput(result(resultKind, value, self));
   };
+  const callAsync: DispatchCallAsync = (pointer, args, self) => {
+    let prepared: ReturnType<typeof convert>;
+    try {
+      prepared = convert(pointer, args, false);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const flags = kind === "propget" ? DISPATCH_PROPERTYGET : DISPATCH_METHOD;
+    const pending = invokeAsync(pointer as DispatchPointer, dispid, flags, prepared.converted, { named: prepared.named, name: member });
+    return linkOperation(
+      pending.then((value) => (valueType === null ? undefined : wrapOutput(result(resultKind, value, self)))),
+      pending,
+    );
+  };
+  return { call, callAsync };
 }
 
 /**
@@ -156,6 +184,7 @@ export function DISPMETHOD<const I extends readonly IdlFlag[], const R extends C
   const dispid = dispidOf(name, idlflags);
   const infos = parameters(name, params);
   const inputs = infos.filter((info) => info.input);
+  const calls = makeCall(name, dispid, kind, infos, restype);
   return Object.freeze({
     name: kind === "propget" ? `_get_${name}` : kind === "propput" ? `_set_${name}` : kind === "propputref" ? `_setref_${name}` : name,
     restype: null,
@@ -167,7 +196,8 @@ export function DISPMETHOD<const I extends readonly IdlFlag[], const R extends C
     marshal: null,
     requiredArguments: inputs.filter((info) => !info.optional).length,
     inputArguments: inputs.length,
-    dispatch: makeCall(name, dispid, kind, infos, restype),
+    dispatch: calls.call,
+    dispatchAsync: kind === "method" ? calls.callAsync : null,
     writable: false,
     params: Object.freeze(infos),
     valueType: restype,
@@ -187,8 +217,8 @@ export function DISPPROPERTY<const I extends readonly IdlFlag[], const T extends
   if (typeof name !== "string" || !name) throw new TypeError("DISPPROPERTY requires a name");
   const dispid = dispidOf(name, idlflags);
   const writable = !idlflags.includes("readonly");
-  const get = makeCall(name, dispid, "propget", [], type);
-  const set = makeCall(name, dispid, "method", [], type);
+  const get = makeCall(name, dispid, "propget", [], type).call;
+  const set = makeCall(name, dispid, "method", [], type).call;
   return Object.freeze({
     name: `_get_${name}`,
     restype: null,

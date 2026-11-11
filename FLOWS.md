@@ -3,7 +3,7 @@
 Questo documento descrive i flussi implementati, non una proposta architetturale.
 Uso dell'API ed esempi sono nel [README](./README.md).
 
-Verifica sul codice: **9 novembre 2026**.
+Verifica sul codice: **10 novembre 2026**.
 
 L'import non carica DLL: `ole32.dll` e `oleaut32.dll` vengono aperte alla prima chiamata nativa
 (`low-level/native.ts`). I prototipi `WINFUNCTYPE` dei metodi vengono creati al primo binding di uno slot, le
@@ -31,7 +31,8 @@ in `automation/dispatch.ts`, viene creato all'import, senza caricare DLL). Per q
 17. [Interfacce predefinite](#17-interfacce-predefinite)
 18. [ByRef, record e thread](#18-byref-record-e-thread)
 19. [Limitazioni note](#19-limitazioni-note)
-20. [Riferimenti al codice](#riferimenti-al-codice)
+20. [Esecuzione asincrona: executor e apartment](#20-esecuzione-asincrona-executor-e-apartment)
+21. [Riferimenti al codice](#riferimenti-al-codice)
 
 ## 1. Architettura a livelli
 
@@ -45,7 +46,8 @@ flowchart TD
     CM["commethod.ts / dispmethod.ts: COMMETHOD, DISPMETHOD, codec dei parametri"]
     RT["runtime.ts: CoInitializeEx, apartment(), CoCreateInstance(Ex), CoGetClassObject, CoTaskMem*"]
     IF["interface.ts: STDMETHOD, COMInterface, classi POINTER(I), registro IID"]
-    PTR["pointer.ts: COMPointer, slot, errcheck HRESULT"]
+    PTR["pointer.ts: COMPointer, slot, errcheck HRESULT, route asincrone, sync()"]
+    EXE["executor: Executor COM (MTA), executorCall, GIT, handover, run()"]
     TRK["tracking.ts: riferimenti vivi, generazione, FinalizationRegistry"]
     ERR["errors.ts / errorinfo.ts: COMError, ISupportErrorInfo, GetErrorInfo"]
     GUID["guid.ts: GUID (Structure 16 byte)"]
@@ -63,6 +65,7 @@ flowchart TD
     CM --> IF
     CM --> AUT
     PTR --> TRK
+    PTR --> EXE --> FFI
     PTR --> ERR
     RT --> GUID
     PTR --> LOW
@@ -123,6 +126,9 @@ I metodi `HRESULT` sono legati con restype `c_int32`. Con `ctypes.HRESULT`, node
 lancerebbe un `Error` generico prima dell'errcheck, perdendo metodo e `IErrorInfo`.
 Per i metodi COMMETHOD lo slot chiama `spec.marshal` invece della funzione (sezione 10).
 
+Questo e' il percorso sincrono: proprieta', `sync()`, chiamate interne e chiamate "a casa". I metodi
+installati sul prototype passano invece da `invokeSlotAsync` (sezione 20).
+
 ## 4. Errori HRESULT e IErrorInfo
 
 ```mermaid
@@ -142,7 +148,8 @@ errcheck, quindi niente ricorsione. Qualsiasi eccezione interna produce `details
 `text` arriva da `FormatMessageW` (`ctypes.FormatError`), localizzato dal sistema; per gli HRESULT
 `0x800Axxxx` (errori VB) senza testo di sistema, dalle stringhe di vbscript.dll se installata.
 Le funzioni libere (`CoCreateInstance`, `CLSIDFromProgID`, ...) usano `checkHRESULT`
-senza `IErrorInfo`, come `OleDLL` in Python.
+senza `IErrorInfo`, come `OleDLL` in Python. Per le chiamate sull'executor `IErrorInfo` e' letto sul thread
+dell'executor (sezione 20).
 
 ## 5. Ownership dei puntatori
 
@@ -283,14 +290,16 @@ flowchart TD
     GTI --> DUAL
     DUAL -->|"si"| VT["GetRefTypeOfImplType(-1): parte vtable"]
     DUAL -->|"no"| LIB
-    VT --> LIB["GetContainingTypeLib -> GetModule; definizione con quell'IID nel modulo, o findInterface(iid)"]
+    VT --> LIB["GetContainingTypeLib -> getModuleSync; definizione con quell'IID nel modulo, o findInterface(iid)"]
     LIB --> QI{"QueryInterface(definizione)"}
     QI -->|"ok"| TYPED["puntatore tipizzato"]
     QI -->|"no, dispinterface"| VIEW["IDispatch visto come la dispinterface (solo Invoke)"]
     QI -->|"no"| SAME
 ```
 
-- `GetModule` cerca prima nella cache con il `TLIBATTR`, senza rileggere la libreria (sezione 15).
+- `getModuleSync` cerca prima nella cache con il `TLIBATTR`, senza rileggere la libreria (sezione 15).
+  `CreateObject`, `GetObject` e `GetActiveObject` (`manageLoaded`) caricano prima la stessa libreria con
+  `await GetModule` (`loadBestModule`, a fette): `GetBestInterface` la trova poi in cache.
 - `client/best.ts` installa, quando viene caricato, due comportamenti, come `comtypes.client` con
   `wrap_outparam`. Viene caricato dall'entry point principale e da `@node-ctypes/comtypes/client`; chi importa solo
   altri subpath (`/interfaces`, `/typelib`, `/server`, `/automation`) non li ha:
@@ -305,7 +314,7 @@ flowchart TD
   derivati da `IDispatch` (`DispatchTarget`): lo stato (cache dei DISPID) e' in una `WeakMap` per puntatore, e
   i risultati sono oggetti dinamici.
 - `Constants(obj)` (`client/constants.ts`): `typeLibOf` (`IProvideClassInfo` o `IDispatch::GetTypeInfo`) ->
-  `GetModule`; dal modulo prende i membri degli enum e le costanti dei `module` (il primo nome vince), poi i
+  `getModuleSync`; dal modulo prende i membri degli enum e le costanti dei `module` (il primo nome vince), poi i
   nomi degli enum e degli alias. Il risultato e' un `Proxy` su un oggetto congelato (in cache per modulo) che
   lancia `TypeError` per i nomi sconosciuti, tranne simboli, `then` e `toJSON`.
 
@@ -594,13 +603,26 @@ flowchart TD
   L'interfaccia di default di una coclass e' quella `[default]`, altrimenti la prima, altrimenti `IDispatch`. I
   record con GUID ricevono `setRecordTypeInfo` (sezione 18). Gli alias locali esportano lo stesso oggetto del
   bersaglio.
-- `GetModule(source, { cacheDir })`: carica la libreria, legge `TLIBATTR` e restituisce il modulo in cache per
-  LIBID, versione e LCID senza rileggere la libreria; altrimenti `readTypeLib` e `buildModule`. Il percorso
+- `GetModule(source, { cacheDir })` (Promise) e `getModuleSync`: carica la libreria, legge `TLIBATTR` e
+  restituisce il modulo in cache per LIBID, versione e LCID senza rileggere la libreria; altrimenti
+  `readTypeLib` e `buildModule`. Il percorso
   del file viene ricordato solo per le sorgenti file (`.dll`, `.tlb`, `.olb`, `.ocx`, `.exe`, anche con `\N`) e solo
   alla prima costruzione: se il modulo e' gia' in cache da un'altra sorgente, resta senza percorso. Accetta anche
   un `TypeLibModel`. Con `cacheDir` (o `NODE_COMTYPES_CACHE`) scrive anche
   `<Library>.ts` senza sovrascrivere; le coppie libreria/cartella gia' scritte sono ricordate, quindi la
   rilettura completa avviene una sola volta.
+- **A fette** (`steps.ts`): lettura e build sono generatori (`readTypeLibSteps`, `buildModuleSteps`) che
+  cedono dopo ogni tipo. `getModuleSync` (e `readTypeLib`/`buildModule`) li esegue fino in fondo (`runSync`);
+  `GetModule` li esegue a fette di 8 ms e cede all'event loop con `setImmediate` (`runSliced`), quindi la pausa
+  piu' lunga e' quella di un tipo (su mshtml 60-140 ms invece di circa 4 s). La maggior parte del lavoro e'
+  JavaScript (conversioni e costruzione del modello): portare le chiamate COM sull'executor la renderebbe circa
+  5 volte piu' lenta (misurato su mshtml: 246 mila chiamate). Le chiamate concorrenti per la stessa libreria
+  condividono un solo caricamento (`loading`, per chiave; chi arriva dopo cede la Promise in corso). Una
+  `getModuleSync` concorrente costruisce da se': alla fine resta il primo modulo registrato in cache.
+- Libreria tramite proxy (`inProcess` in `load.ts`): la libreria di un oggetto in un altro apartment o processo
+  e' un proxy, e leggerla chiamata per chiamata attraverserebbe l'apartment (`htmlfile` in uno STA: 13,5 s invece
+  di 3,5 s). `loadTypeLib` di un puntatore ne legge l'identita' (`TLIBATTR`, una chiamata) e carica la stessa
+  libreria registrata con `LoadRegTypeLib`; se non e' registrata (creata in memoria) usa il proxy.
 - `COMObject`: se un'interfaccia viene da una type library (`typeLibLocationOf`), `GetTypeInfo` restituisce
   l'`ITypeInfo` (libreria caricata una volta per LIBID/versione/LCID).
 
@@ -661,10 +683,12 @@ dalle type library (`builtinInterfaceDefs`).
 
 ## 19. Limitazioni note
 
-- Le chiamate sono sincrone e bloccano l'event loop; i messaggi Win32 vanno pompati esplicitamente
-  (`startMessagePump`, `PumpEvents`).
+- I metodi girano su un solo thread executor, in ordine FIFO: una chiamata lenta ritarda le successive (non
+  l'event loop). Ogni chiamata costa un giro sul thread dell'executor (circa 20 µs per un metodo tipizzato con
+  node-ctypes 2.12, contro 2-4 µs in modo sincrono); per i cicli di molte chiamate veloci c'e' `sync()`. I messaggi Win32 vanno pompati esplicitamente (`startMessagePump`, `PumpEvents`).
+- Gli oggetti dentro argomenti `ByRef` o VARIANT passate per indirizzo non vengono passati fra apartment.
 - `_threading_ = "free"`: le chiamate da altri thread aspettano il thread JS; se questo e' bloccato in una
-  chiamata COM sincrona che le provoca, deadlock.
+  chiamata COM sincrona che le provoca (`sync()`, chiamata a casa), deadlock.
 - I `COMObject` forniscono type info solo per interfacce costruite da una type library.
 - InprocServer32 non e' realizzabile (Node non si carica da una DLL), quindi `_reg_threading_` e `_reg_clsctx_`
   non hanno equivalente; le interfacce vtable custom tra processi richiedono la type library registrata
@@ -686,11 +710,123 @@ dalle type library (`builtinInterfaceDefs`).
 - `wintypes.DWORD`/`LONG`/`ULONG` sono `bigint` in node-ctypes: le interfacce usano `c_uint32`/`c_int32`.
 - Il runtime Scripting (FSO, Dictionary) e la Shell non implementano `ISupportErrorInfo`: per le chiamate
   vtable i `details` sono `null`. Il percorso e' verificato con MSXML 6.
-- Su Windows (Node 26), un processo che chiama `CoUninitialize` subito dopo molto lavoro (per esempio la CLI dopo
-  `readTypeLib`) puo' terminare raramente con `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` in
-  `src\win\async.c`, dopo aver completato il lavoro. Non si riproduce senza GC concorrente
-  (`--single-threaded-gc`) ne' con una breve attesa prima dell'uscita: e' una corsa all'uscita fra i thread
-  di V8 e il loop di Node, non un errore del codice COM.
+- Su Windows (Node 26), un processo che termina subito dopo molto lavoro e `CoUninitialize` (per esempio la
+  CLI dopo `readTypeLib`) puo' terminare con `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` in
+  `src\win\async.c`, dopo aver completato il lavoro: e' una corsa all'uscita fra i task del GC concorrente di
+  V8 e la chiusura del loop di Node, non un errore del codice COM. Misurata sulla CLI `generate`: 14 uscite
+  su 40; nessuna con `--single-threaded-gc`. La CLI attende un giro di loop (`setTimeout(0)`) prima di
+  uscire: 0 su 50. Le applicazioni che escono subito dopo un lavoro intenso possono fare lo stesso.
+
+## 20. Esecuzione asincrona: executor e apartment
+
+Regola: **le chiamate sono asincrone, l'accesso live e' sincrono**. Metodi (COMMETHOD, STDMETHOD, DISPMETHOD,
+metodi dei dynamic object), `CreateObject`/`GetObject`/`GetActiveObject` e `for await` restituiscono Promise;
+proprieta', `QueryInterface`/`Release`, conversioni, `getModuleSync`, `GetEvents` e lato server restano sincroni.
+`GetModule` restituisce una Promise ma gira sul thread JavaScript, a fette (sezione 15).
+
+### Executor COM
+
+`executor/executor.ts` crea pigramente un `ctypes.Executor({ name: "node-comtypes" })` (thread nativo di
+node-ctypes con coda FIFO, non un worker libuv). Il primo job accodato e' `CoInitializeEx(MTA)`. Le chiamate
+usano `fn.callOn(executor, ...args)`: stesse conversioni di `callAsync`, memoria degli argomenti trattenuta
+fino al completamento, risultato consegnato sul thread JS. L'executor tiene vivo il processo solo con chiamate in
+sospeso. `finalize()` accoda `CoUninitialize`, chiude con drain e attende un giro dell'event loop
+(`setImmediate`), cosi' le Promise delle operazioni drenate, che si risolvono qualche microtask dopo le
+loro chiamate, sono gia' risolte quando la sua si risolve; una chiamata successiva crea un nuovo
+executor e incrementa la generazione (`executorGeneration()`), cosi' i riferimenti posseduti dal precedente
+vengono riconosciuti come scaduti. `stats()` restituisce `{ running, pending, completed, generation }`.
+
+`executorCall(call, { signal })` (low-level) e' la chiamata raw, una sola Promise dopo la chiamata. Come in
+Python comtypes, `GetErrorInfo(0, &p)` gira solo dopo un HRESULT di errore, e deve essere la chiamata successiva
+sul thread dell'executor (un'altra chiamata potrebbe sostituire o azzerare l'oggetto errore): lo e' se dopo la
+chiamata fallita non ne e' stata inviata un'altra: l'id del job della chiamata arriva da node-ctypes
+(`callOn` lo scrive in `_job` dell'oggetto target, `CallTarget`, per quella sola invocazione) e si confronta con
+l'id dell'ultimo job dell'Executor (`_lastJob`, letto da `lastJob`). Altrimenti, per esempio in una raffica di chiamate gia'
+accodate, il `COMError` resta senza `details`. `ISupportErrorInfo` e i campi di `IErrorInfo` vengono letti con
+altre chiamate sull'executor, dove l'oggetto errore vive.
+
+### Route di un puntatore
+
+Ogni `COMPointer` calcola una volta (per stato condiviso con le viste `sync()`) la route delle chiamate asincrone:
+
+```mermaid
+flowchart TD
+    A["#route()"] --> L{"COMObject JS 'apartment' o COM non inizializzato a casa?"}
+    L -->|si| H["home: chiamata sincrona sul thread JS, Promise risolta"]
+    L -->|no| M{"home MTA?"}
+    M -->|si| S1["shared: stesso indirizzo sull'executor"]
+    M -->|no| F{"COMObject 'free', IAgileObject o FTM?"}
+    F -->|si| S2["shared + handover dei risultati"]
+    F -->|no| P{"indirizzo e' un proxy?"}
+    P -->|no| H
+    P -->|si| G["proxy: riferimento dell'executor via GIT"]
+    G -->|interfaccia non marshalabile| H
+```
+
+- **home**: il puntatore vive in uno STA a casa e non e' agile, o e' un `COMObject` "apartment": la chiamata
+  avviene sul thread JS, la Promise ha la stessa forma.
+- **shared**: home MTA (stesso apartment dell'executor) o oggetto agile: l'executor usa lo stesso indirizzo.
+  `Release` con chiamate ancora in corso viene accodato dietro di esse (`releaseOnExecutor`).
+- **proxy** (`executor/apartment.ts`, `referenceForExecutor`): il puntatore viene registrato nella GIT del
+  thread home e letto dalla GIT dell'executor, che ottiene un proprio riferimento. Questo riferimento e' rilasciato
+  sull'executor (`Release`, `using` o `FinalizationRegistry`). Se l'executor e' stato chiuso nel frattempo,
+  `#dispatch` ricalcola la route sul nuovo executor.
+
+Prima di ogni chiamata l'**ispettore degli argomenti** (`setArgumentInspector`, in `automation/variant.ts`)
+controlla gli argomenti: `COMObject` "apartment" o puntatori non trasferibili costringono la chiamata a casa.
+
+### Risultati di interfaccia (handover)
+
+Con route proxy o agile, i risultati di interfaccia scritti dall'executor (out pointer, VARIANT, SAFEARRAY di
+oggetti, `ResultLocation`) appartengono all'MTA. Prima che la Promise si risolva, `handOver` li sostituisce in
+place con riferimenti validi a casa:
+
+```mermaid
+sequenceDiagram
+    participant JS as thread JS (STA)
+    participant EX as executor (MTA)
+    JS->>EX: callOn(metodo) con out pointer
+    EX-->>JS: HRESULT, *out = puntatore MTA
+    JS->>EX: QueryInterface(IAgileObject)
+    alt agile
+        EX-->>JS: stesso riferimento valido ovunque
+    else non agile
+        JS->>EX: RegisterInterfaceInGlobal (GIT dell'executor), Release
+        JS->>JS: GetInterfaceFromGlobal (GIT di casa), Revoke
+        JS->>JS: *out = proxy di casa
+    end
+    JS->>JS: wrapOutput, Promise risolta
+```
+
+### Creazione degli oggetti
+
+`CreateObject`, `GetObject` e `GetActiveObject` chiamano `CoCreateInstance(Ex)`, `CoGetObject` e
+`GetActiveObject` sull'executor (`obtain`): l'oggetto vive nell'MTA (o nello STA host di COM per le classi
+"Apartment") e il thread JS riceve il proprio riferimento con l'handover. Con `{ home: true }` (`obtainHome`) la
+chiamata avviene sul thread JS; le classi registrate localmente con `registerClassObject` (`executor/classes.ts`)
+vengono create a casa automaticamente, perche' l'executor non vede le class factory del thread JS. Una query
+per un'interfaccia duale non marshalabile ricade su una variante di dispatch (`client/dual.ts`): stessi
+membri, chiamati con `IDispatch::Invoke` e i DISPID della type library.
+
+### Metodi asincroni
+
+`COMMETHOD` divide `marshal` in prepara (codec degli input e holder delle uscite, sul thread JS), chiamata
+(`callOn`) e lettura (holder, `wrapOutput`, pulizia dopo l'await). `DISPMETHOD` e il client dinamico usano
+`prepareInvoke` (DISPPARAMS ed EXCEPINFO costruiti sul thread JS, `Invoke` sull'executor, EXCEPINFO letto
+dopo). `for await` chiama `_NewEnum` e accoda 32 `IEnumVARIANT::Next(1)` alla volta (alcuni enumeratori, come
+`FolderItems` della Shell, ripetono lo stesso elemento con `celt > 1`).
+
+`run(promise, { signal })` (`executor/operations.ts`): ogni operazione (`Operation`) registra gli id dei job che
+accoda sull'executor (l'id di ogni chiamata arriva da `callOn` in `_job` dell'oggetto target, non viene ricostruito); all'abort la Promise viene rifiutata con `signal.reason`, i job ancora in coda vengono
+tolti con `_cancel(id, reason)` dell'Executor (interno a node-ctypes, come `_lastJob`, letto da `cancelJob`) e le
+chiamate inviate dopo vengono rifiutate subito; quella gia' partita completa. Nessun `AbortController` ne'
+listener per chiamata: la cancellazione costa solo a chi usa `run()` con un segnale.
+
+### Electron
+
+Il thread principale di Electron e' lo STA dell'UI di Chromium (`CoInitializeEx(MTA)` restituisce
+`RPC_E_CHANGED_MODE`). I metodi girano sull'executor e l'UI non si blocca. Chromium pompa i messaggi, quindi gli
+eventi arrivano senza `startMessagePump`. Verificato con Electron 45 (`tests/electron/main.mjs`).
 
 ## Riferimenti al codice
 
@@ -720,5 +856,7 @@ dalle type library (`builtinInterfaceDefs`).
 - [src/server/register.ts](./src/server/register.ts): `registerClassObject`, `registerServer`, `UseCommandLine`, `runLocalServer`.
 - [src/pump.ts](./src/pump.ts): message pump.
 - [src/threads.ts](./src/threads.ts): marshaling tra thread, GIT.
+- [src/executor](./src/executor): executor COM (`executor.ts`), route, GIT e handover (`apartment.ts`), `run` (`operations.ts`), classi locali (`classes.ts`).
+- [src/client/dual.ts](./src/client/dual.ts): varianti di dispatch delle interfacce duali.
 - [src/typelib](./src/typelib): caricamento e registrazione (`load.ts`), modello, build, generatore, `GetModule`; [src/cli.ts](./src/cli.ts): CLI.
 - [src/interfaces](./src/interfaces): interfacce predefinite (`dispatch.ts`, `typeinfo.ts`, `persist.ts`, `servprov.ts`, `viewobject.ts`, `shelllink.ts`, `stream.ts`, ...).

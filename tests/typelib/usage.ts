@@ -11,12 +11,12 @@ using _ = apartment();
 const results: Record<string, unknown> = {};
 
 {
-  using dict = CreateObject(Scripting.Dictionary);
+  using dict = await CreateObject(Scripting.Dictionary);
   dict.CompareMode = Scripting.CompareMethod.TextCompare;
-  dict.Add("Key", 1);
+  await dict.Add("Key", 1);
   const count: number = dict.Count;
-  const exists: boolean = dict.Exists("KEY");
-  results.dictionary = [count, exists, dict.Item("key"), dict.Keys()];
+  const exists: boolean = await dict.Exists("KEY");
+  results.dictionary = [count, exists, dict.Item("key"), await dict.Keys()];
   // Type checks only (never called).
   const _readOnly = () => {
     // @ts-expect-error Count is read-only.
@@ -25,26 +25,26 @@ const results: Record<string, unknown> = {};
   void _readOnly;
 }
 {
-  using fso = CreateObject(Scripting.FileSystemObject);
-  using folder = fso.GetSpecialFolder(Scripting.SpecialFolderConst.TemporaryFolder)!;
+  using fso = await CreateObject(Scripting.FileSystemObject);
+  using folder = (await fso.GetSpecialFolder(Scripting.SpecialFolderConst.TemporaryFolder))!;
   const path: string = folder.Path;
   using parent = folder.ParentFolder;
-  results.fso = [path.length > 0, typeof parent?.Name, fso.FolderExists(path)];
+  results.fso = [path.length > 0, typeof parent?.Name, await fso.FolderExists(path)];
 }
 {
-  using document = CreateObject(MSXML2.DOMDocument60);
+  using document = await CreateObject(MSXML2.DOMDocument60);
   document.async = false;
-  const loaded: boolean = document.loadXML("<root><item id='1'>a</item><item id='2'>b</item></root>");
+  const loaded: boolean = await document.loadXML("<root><item id='1'>a</item><item id='2'>b</item></root>");
   using root = document.documentElement!;
-  using list = root.selectNodes("item")!;
+  using list = (await root.selectNodes("item"))!;
   using first = list.item(0)!;
   results.msxml = [loaded, root.nodeName, list.length, first.text, first.nodeType === MSXML2.DOMNodeType.NODE_ELEMENT];
 }
 {
   using pump = startMessagePump();
-  using locator = CreateObject(WbemScripting.SWbemLocator);
-  using services = locator.ConnectServer()!;
-  using sink = CreateObject(WbemScripting.SWbemSink);
+  using locator = await CreateObject(WbemScripting.SWbemLocator);
+  using services = (await locator.ConnectServer())!;
+  using sink = await CreateObject(WbemScripting.SWbemSink);
   let completed = false;
   const names: string[] = [];
   using connection = GetEvents(sink, {
@@ -55,13 +55,13 @@ const results: Record<string, unknown> = {};
       completed = true;
     },
   });
-  services.ExecQueryAsync(sink, `SELECT Name FROM Win32_Process WHERE ProcessId = ${process.pid}`);
+  await services.ExecQueryAsync(sink, `SELECT Name FROM Win32_Process WHERE ProcessId = ${process.pid}`);
   results.wmi = [await waitFor(() => completed, { timeout: 20_000 }), names, connection.interface.name];
   void pump;
 }
 {
-  using shell = CreateObject(Shell32.Shell);
-  using folder = shell.NameSpace(Shell32.ShellSpecialFolderConstants.ssfWINDOWS)!;
+  using shell = await CreateObject(Shell32.Shell);
+  using folder = (await shell.NameSpace(Shell32.ShellSpecialFolderConstants.ssfWINDOWS))!;
   const title: string = folder.Title;
   results.shell = [title.length > 0];
 }

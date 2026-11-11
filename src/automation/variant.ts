@@ -7,7 +7,8 @@ import type { InterfaceDef } from "../interface.ts";
 import { allocBSTR, oleaut32, POINTER_SIZE, readBSTR, readMemory, writeMemory } from "../low-level/native.ts";
 import { rawAddRef, rawQueryInterface, rawRelease } from "../low-level/vtable.ts";
 import { RecordInfo, recordParts } from "./record.ts";
-import { COMPointer } from "../pointer.ts";
+import { COMPointer, setArgumentInspector, sharedWithExecutor } from "../pointer.ts";
+import { NamedArguments } from "./named.ts";
 import {
   VT_ARRAY,
   VT_BOOL,
@@ -376,6 +377,8 @@ export const comReference: unique symbol = Symbol.for("node-comtypes.reference")
 export interface BorrowedReference {
   readonly address: bigint;
   readonly interface: InterfaceDef<any>;
+  /** Objects implemented in JavaScript: whether other threads may call them (`free`). */
+  readonly threading?: "apartment" | "free";
 }
 
 /** The interface pointer behind a COM pointer, a dynamic object or a JavaScript COM object, if any. */
@@ -796,3 +799,34 @@ export class VARIANT extends ctypes.Structure {
     return this.toString();
   }
 }
+
+// ── asynchronous calls ────────────────────────────────────────────────
+
+/**
+ * Whether `value`, passed to a call that runs on the COM executor, is usable
+ * there: COM objects must be shared with the executor (home thread in the
+ * multithreaded apartment, or agile objects); objects implemented in
+ * JavaScript must be free-threaded, since the executor (or the objects it
+ * calls) would call them from another thread.
+ */
+function transferable(value: unknown, homeMultithreaded: boolean): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return true;
+  if (value instanceof COMPointer) return homeMultithreaded || sharedWithExecutor(value);
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || value instanceof Date) return true;
+  const record = value as Record<symbol, unknown>;
+  const pointer = record[comPointer];
+  if (pointer instanceof COMPointer) return homeMultithreaded || sharedWithExecutor(pointer);
+  const lend = record[comReference];
+  if (typeof lend === "function") return (lend as () => BorrowedReference | null).call(value)?.threading === "free";
+  if (value instanceof VARIANT) {
+    // An object inside a VARIANT belongs to the home apartment.
+    const vt = value.vt;
+    return homeMultithreaded || ((vt & VT_TYPEMASK) !== VT_DISPATCH && (vt & VT_TYPEMASK) !== VT_UNKNOWN && (vt & VT_TYPEMASK) !== VT_VARIANT && !(vt & (VT_ARRAY | VT_BYREF)));
+  }
+  if (value instanceof ByRef || value instanceof Typed) return transferable(value.value, homeMultithreaded);
+  if (value instanceof NamedArguments) return Object.values(value.values).every((item) => transferable(item, homeMultithreaded));
+  if (Array.isArray(value)) return value.every((item) => transferable(item, homeMultithreaded));
+  return true;
+}
+
+setArgumentInspector((args, homeMultithreaded) => args.every((value) => transferable(value, homeMultithreaded)));

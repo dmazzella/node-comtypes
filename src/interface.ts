@@ -1,9 +1,10 @@
 import * as ctypes from "node-ctypes";
 import { GUID, toGUID } from "./guid.ts";
 import type { GUIDLike } from "./guid.ts";
-import { COMPointer, createSlot, invokeSlot } from "./pointer.ts";
+import { COMPointer, createSlot, invokeSlot, invokeSlotAsync } from "./pointer.ts";
 import type { Slot, SlotOwner } from "./pointer.ts";
 import type { ArgumentsOf, CommethodFunction, OutValue, ParamSpec } from "./commethod.ts";
+import type { ResultLocation } from "./executor/apartment.ts";
 
 /** HRESULT restype marker: such methods raise {@link COMError} on failure. */
 export const HRESULT = ctypes.HRESULT;
@@ -18,8 +19,21 @@ export type MethodKind = "method" | "propget" | "propput" | "propputref";
  */
 export type MethodMarshal = (fn: (...args: any[]) => any, address: bigint, args: readonly unknown[], self: InterfaceDef<any>) => unknown;
 
+/**
+ * Runs a native call on the COM executor: `native` are the converted
+ * arguments (without `this`), `results` the locations of interface results.
+ * Resolves with the raw result; rejects with {@link COMError} for HRESULT failures.
+ */
+export type NativeRunner = (native: readonly unknown[], results: readonly ResultLocation[]) => Promise<unknown>;
+
+/** Asynchronous counterpart of {@link MethodMarshal}: converts, awaits `run`, converts the results. */
+export type MethodMarshalAsync = (run: NativeRunner, args: readonly unknown[], self: InterfaceDef<any>) => Promise<unknown>;
+
 /** Calls a dispatch member (DISPMETHOD / DISPPROPERTY) through `IDispatch::Invoke`; `put` for property writes. */
 export type DispatchCall = (pointer: COMPointer, args: readonly unknown[], self: InterfaceDef<any>, put?: boolean) => unknown;
+
+/** Calls a dispatch method through `IDispatch::Invoke` on the COM executor. */
+export type DispatchCallAsync = (pointer: COMPointer, args: readonly unknown[], self: InterfaceDef<any>) => Promise<unknown>;
 
 /**
  * A vtable method. `F` is the JavaScript signature for STDMETHOD; COMMETHOD
@@ -39,12 +53,16 @@ export interface MethodSpec<N extends string = string, F extends (...args: any[]
   /** `dispid(n)` IDL flag, if any. */
   readonly dispid: number | null;
   readonly marshal: MethodMarshal | null;
+  /** Asynchronous conversion (COMMETHOD); `null`: raw arguments. */
+  readonly marshalAsync?: MethodMarshalAsync | null;
   /** Number of required JavaScript arguments (COMMETHOD), `null` for STDMETHOD. */
   readonly requiredArguments: number | null;
   /** Number of JavaScript input arguments (COMMETHOD), `null` for STDMETHOD. */
   readonly inputArguments: number | null;
   /** Dispatch members (DISPMETHOD / DISPPROPERTY): no vtable slot, called through `IDispatch::Invoke`. */
   readonly dispatch?: DispatchCall | null;
+  /** Asynchronous call of a dispatch method. */
+  readonly dispatchAsync?: DispatchCallAsync | null;
   /** DISPPROPERTY without `readonly`: also writable. */
   readonly writable?: boolean;
   /** Type-level only. */
@@ -76,6 +94,7 @@ export function STDMETHOD<const R extends ctypes.FFIType | null, const N extends
     property: name,
     dispid: null,
     marshal: null,
+    marshalAsync: null,
     requiredArguments: null,
     inputArguments: null,
   });
@@ -111,20 +130,41 @@ export type PropertiesOf<M extends readonly MethodSpec[], Self = unknown> = {
   -readonly [S in M[number] as S extends Setter<S> ? (S["property"] extends keyof AccessorNames<M, Self> ? never : MethodFunction<S, Self> extends (value: any) => any ? S["property"] : never) : never]: Parameters<MethodFunction<S, Self>>[0];
 };
 
-/** Method and property signatures of a `methods` tuple, with `SELF` resolved to `Self`. */
-export type MethodsOf<M extends readonly MethodSpec[], Self = unknown> = { [S in M[number] as S["name"]]: MethodFunction<S, Self> } & PropertiesOf<M, Self>;
+/** The same function, returning a promise of its result. */
+export type Asynchronous<F> = F extends (...args: infer A) => infer R ? (...args: A) => Promise<Awaited<R>> : F;
+
+/** A member as installed on pointers: methods (kind `method`) are asynchronous, accessors synchronous. */
+type MemberOf<S, Self> = S extends { readonly kind: "method" } ? Asynchronous<MethodFunction<S, Self>> : MethodFunction<S, Self>;
+
+/**
+ * Method and property signatures of a `methods` tuple, with `SELF` resolved
+ * to `Self`: methods return promises, properties and accessors are synchronous.
+ */
+export type MethodsOf<M extends readonly MethodSpec[], Self = unknown> = { [S in M[number] as S["name"]]: MemberOf<S, Self> } & PropertiesOf<M, Self>;
+
+/** Like {@link MethodsOf}, with every method synchronous (the `sync()` view). */
+export type SyncMethodsOf<M extends readonly MethodSpec[], Self = unknown> = { [S in M[number] as S["name"]]: MethodFunction<S, Self> } & PropertiesOf<M, Self>;
 
 /** Method signatures of an interface, including the inherited ones. */
 export type InterfaceMethods<I> = I extends { readonly __methods?: infer T } ? NonNullable<T> : {};
 
+/** Synchronous method signatures of an interface, including the inherited ones. */
+export type SyncInterfaceMethods<I> = I extends { readonly __sync?: infer T } ? NonNullable<T> : {};
+
 /** A typed pointer to interface `I`: {@link COMPointer} plus the interface methods and properties. */
 export type InterfacePointer<I extends InterfaceDef<any> = InterfaceDef> = COMPointer<I> & Omit<InterfaceMethods<I>, keyof COMPointer>;
+
+/** A synchronous view of a pointer to interface `I` (see `sync()`). */
+export type SyncPointer<I extends InterfaceDef<any> = InterfaceDef> = COMPointer<I> & Omit<SyncInterfaceMethods<I>, keyof COMPointer>;
+
+/** The synchronous view type of a pointer type. */
+export type Synchronous<P> = P extends COMPointer<infer I> ? SyncPointer<I> : never;
 
 /** Pointer class generated for an interface. */
 export type PointerClass = new (address: bigint, iface: InterfaceDef<any>) => COMPointer;
 
 /** Interface definition returned by {@link COMInterface}. */
-export interface InterfaceDef<TMethods extends object = {}> {
+export interface InterfaceDef<TMethods extends object = {}, TSync extends object = TMethods> {
   readonly name: string;
   readonly iid: GUID;
   readonly base: InterfaceDef<any> | null;
@@ -139,12 +179,19 @@ export interface InterfaceDef<TMethods extends object = {}> {
   readonly dispMethods: readonly MethodSpec[];
   /** Pointer class: a {@link COMPointer} subclass with the interface methods. */
   readonly Pointer: PointerClass;
+  /** Class of the synchronous views (`sync()`). */
+  readonly SyncPointer: PointerClass;
   /** Type-level only: the method signatures. Never set at runtime. */
   readonly __methods?: TMethods;
+  /** Type-level only: the synchronous method signatures. Never set at runtime. */
+  readonly __sync?: TSync;
 }
 
 /** Definition type of `COMInterface({ extends: B, methods: M, dispMethods: D })`; recursive so that `SELF` refers to it. */
-export interface ComInterfaceDef<B, M extends readonly MethodSpec[], D extends readonly MethodSpec[] = readonly []> extends InterfaceDef<InterfaceMethods<B> & MethodsOf<M, ComInterfaceDef<B, M, D>> & MethodsOf<D, ComInterfaceDef<B, M, D>>> {}
+export interface ComInterfaceDef<B, M extends readonly MethodSpec[], D extends readonly MethodSpec[] = readonly []> extends InterfaceDef<
+  InterfaceMethods<B> & MethodsOf<M, ComInterfaceDef<B, M, D>> & MethodsOf<D, ComInterfaceDef<B, M, D>>,
+  SyncInterfaceMethods<B> & SyncMethodsOf<M, ComInterfaceDef<B, M, D>> & SyncMethodsOf<D, ComInterfaceDef<B, M, D>>
+> {}
 
 export interface InterfaceSpec<M extends readonly MethodSpec[], B extends InterfaceDef<any> | undefined, D extends readonly MethodSpec[] = readonly []> {
   readonly name: string;
@@ -206,16 +253,20 @@ function installProperties(prototype: object, methods: readonly MethodSpec[]): v
   }
 }
 
-/** Install dispatch members: methods calling `IDispatch::Invoke`, plus the property accessors. */
-function installDispatchMembers(prototype: object, members: readonly MethodSpec[], owner: SlotOwner): void {
+/**
+ * Install dispatch members: methods calling `IDispatch::Invoke` (on the COM
+ * executor when `asynchronous`), plus the synchronous property accessors.
+ */
+function installDispatchMembers(prototype: object, members: readonly MethodSpec[], owner: SlotOwner, asynchronous: boolean): void {
   const accessors: MethodSpec[] = [];
   for (const member of members) {
     const call = member.dispatch!;
+    const callAsync = asynchronous && member.kind === "method" ? member.dispatchAsync : null;
     if (!(member.name in COMPointer.prototype)) {
       Object.defineProperty(prototype, member.name, {
         value: {
           [member.name](this: COMPointer, ...args: unknown[]) {
-            return call(this, args, owner.definition!);
+            return callAsync ? callAsync(this, args, owner.definition!) : call(this, args, owner.definition!);
           },
         }[member.name],
         writable: true,
@@ -283,24 +334,39 @@ export function COMInterface<const M extends readonly MethodSpec[] = readonly []
   const Parent: PointerClass = base?.Pointer ?? COMPointer;
   const Pointer = class extends Parent {};
   Object.defineProperty(Pointer, "name", { value: `POINTER(${spec.name})` });
+  const SyncParent: PointerClass = base?.SyncPointer ?? COMPointer;
+  const SyncPointer = class extends SyncParent {};
+  Object.defineProperty(SyncPointer, "name", { value: `SYNC(${spec.name})` });
   const first = slots.length - methods.length;
   methods.forEach((method, index) => {
     // COMPointer members (QueryInterface, AddRef, Release, ...) take precedence,
     // as in Python comtypes; the raw slot stays reachable through callMethod().
     if (method.name in COMPointer.prototype) return;
     const slot = first + index;
-    const fn = {
+    const synchronous = {
       [method.name](this: COMPointer, ...args: unknown[]) {
         return invokeSlot(this, slot, args);
       },
     }[method.name];
-    Object.defineProperty(Pointer.prototype, method.name, { value: fn, writable: true, configurable: true });
+    // Methods run on the COM executor; accessors stay synchronous.
+    const asynchronous =
+      method.kind === "method"
+        ? {
+            [method.name](this: COMPointer, ...args: unknown[]) {
+              return invokeSlotAsync(this, slot, args);
+            },
+          }[method.name]
+        : synchronous;
+    Object.defineProperty(Pointer.prototype, method.name, { value: asynchronous, writable: true, configurable: true });
+    Object.defineProperty(SyncPointer.prototype, method.name, { value: synchronous, writable: true, configurable: true });
   });
   installProperties(Pointer.prototype, methods);
-  installDispatchMembers(Pointer.prototype, dispOwn, owner);
+  installProperties(SyncPointer.prototype, methods);
+  installDispatchMembers(Pointer.prototype, dispOwn, owner, true);
+  installDispatchMembers(SyncPointer.prototype, dispOwn, owner, false);
   const dispMethods = Object.freeze([...(base?.dispMethods ?? []), ...dispOwn]);
 
-  const definition = Object.freeze({ name: spec.name, iid, base, methods, allMethods, methodIndex, slots, dispMethods, Pointer });
+  const definition = Object.freeze({ name: spec.name, iid, base, methods, allMethods, methodIndex, slots, dispMethods, Pointer, SyncPointer });
   owner.definition = definition;
   if (spec.register !== false) registry.set(iid.toString(), definition);
   return definition as ComInterfaceDef<B, M, D>;

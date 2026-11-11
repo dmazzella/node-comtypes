@@ -11,7 +11,7 @@ import { checkHRESULT } from "./errors.ts";
 import { GUID, toGUID } from "./guid.ts";
 import type { GUIDLike } from "./guid.ts";
 import { HRESULT, derivesFrom } from "./interface.ts";
-import type { InterfaceDef, InterfacePointer, MethodKind, MethodMarshal, MethodSpec } from "./interface.ts";
+import type { InterfaceDef, InterfacePointer, MethodKind, MethodMarshal, MethodMarshalAsync, MethodSpec } from "./interface.ts";
 import { allocBSTR, ole32, oleaut32, readBSTR, takeCoTaskMemString } from "./low-level/native.ts";
 import { rawAddRef, rawQueryInterface, rawRelease } from "./low-level/vtable.ts";
 import { COMPointer } from "./pointer.ts";
@@ -221,6 +221,8 @@ export type CommethodSpec<I extends readonly IdlFlag[], R, N extends string, P e
 
 interface Holder {
   readonly arg: unknown;
+  /** Interface results: handed over to a single-threaded home apartment after an asynchronous call. */
+  readonly result?: { readonly kind: "pointer" | "variant" | "safearray"; readonly iid?: GUID };
   read(): unknown;
   /** Release what was not consumed by `read`. */
   free(): void;
@@ -336,7 +338,7 @@ function safeArrayCodec(vt: number): Codec {
     },
     output(initial, hasInitial) {
       const start = hasInitial && initial !== null && initial !== undefined ? create(initial) : null;
-      return pointerHolder(
+      const holder = pointerHolder(
         byReference,
         (psa) => {
           try {
@@ -348,6 +350,8 @@ function safeArrayCodec(vt: number): Codec {
         destroySafeArray,
         start,
       );
+      // Arrays of objects are handed over to a single-threaded home element by element.
+      return { ...holder, result: { kind: "safearray" } };
     },
   };
 }
@@ -416,7 +420,7 @@ function interfaceCodec(type: InterfaceDef<any> | SelfMarker | LazyInterface): C
       // [in, out]: the callee may release the input, so it receives its own reference.
       const reference = hasInitial ? interfaceReference(initial, iface) : null;
       if (reference && !reference.owned) rawAddRef(reference.address);
-      return pointerHolder(byReference, (address) => (address ? COMPointer.fromAddress(address, iface) : null), rawRelease, reference?.address ?? null);
+      return { ...pointerHolder(byReference, (address) => (address ? COMPointer.fromAddress(address, iface) : null), rawRelease, reference?.address ?? null), result: { kind: "pointer", iid: iface.iid } };
     },
   };
 }
@@ -434,6 +438,7 @@ const variantCodec: Codec = {
     let consumed = false;
     return {
       arg: variant._buffer,
+      result: { kind: "variant" },
       read() {
         consumed = true;
         try {
@@ -600,6 +605,17 @@ function outputCodec(type: ComParamType): Codec {
 
 const PARAM_FLAGS = new Set<string>(["in", "out", "retval", "lcid", "optional"]);
 
+interface Prepared {
+  readonly native: unknown[];
+  readonly holders: Holder[];
+  readonly cleanup: Array<() => void>;
+}
+
+function release(prepared: Prepared): void {
+  for (const holder of prepared.holders) holder.free();
+  for (const cleanup of prepared.cleanup.reverse()) cleanup();
+}
+
 /**
  * Describe a vtable method with IDL flags. Python equivalent: `comtypes.COMMETHOD`.
  *
@@ -656,7 +672,8 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
   const required = inputs.filter((info) => !info.optional).length;
   const hasOutputs = infos.some((info) => info.output);
 
-  const marshal: MethodMarshal = (fn, address, args, self) => {
+  // Converts the arguments; on failure, releases what was already converted.
+  const prepare = (args: readonly unknown[], self: InterfaceDef<any>): Prepared => {
     let positional = args;
     let byName: Map<string, unknown> | null = null;
     const last = args[args.length - 1];
@@ -666,9 +683,7 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
       for (const key of byName.keys()) if (!inputs.some((info) => info.name.toLowerCase() === key)) throw new TypeError(`${name}: unknown argument ${JSON.stringify(key)}`);
     }
     if (positional.length > inputs.length) throw new TypeError(`${name}: expected at most ${inputs.length} arguments, got ${positional.length}`);
-    const native: unknown[] = [];
-    const holders: Holder[] = [];
-    const cleanup: Array<() => void> = [];
+    const prepared: Prepared = { native: [], holders: [], cleanup: [] };
     try {
       let position = 0;
       infos.forEach((info, index) => {
@@ -688,20 +703,62 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
         }
         if (info.output) {
           const holder = codec.output!(value, info.input && supplied, self);
-          holders.push(holder);
-          native.push(holder.arg);
+          prepared.holders.push(holder);
+          prepared.native.push(holder.arg);
         } else {
-          native.push(codec.input(value, cleanup, self));
+          prepared.native.push(codec.input(value, prepared.cleanup, self));
         }
       });
-      const result = fn(address, ...native);
-      if (!hasOutputs) return result;
-      const values = holders.map((holder) => wrapOutput(holder.read()));
-      return values.length === 1 ? values[0] : values;
-    } finally {
-      for (const holder of holders) holder.free();
-      for (const release of cleanup.reverse()) release();
+      return prepared;
+    } catch (error) {
+      release(prepared);
+      throw error;
     }
+  };
+  const finish = (prepared: Prepared, result: unknown): unknown => {
+    if (!hasOutputs) return result;
+    const values = prepared.holders.map((holder) => wrapOutput(holder.read()));
+    return values.length === 1 ? values[0] : values;
+  };
+
+  const marshal: MethodMarshal = (fn, address, args, self) => {
+    const prepared = prepare(args, self);
+    try {
+      return finish(prepared, fn(address, ...prepared.native));
+    } finally {
+      release(prepared);
+    }
+  };
+  // The converted arguments stay alive (and owned here) until the call completes.
+  // Promise steps instead of an async function: this runs for every method call.
+  const marshalAsync: MethodMarshalAsync = (run, args, self) => {
+    let prepared: Prepared;
+    let pending: Promise<unknown>;
+    try {
+      prepared = prepare(args, self);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    try {
+      const results = prepared.holders.flatMap((holder) => (holder.result ? [{ location: ctypes.addressof(holder.arg as Buffer), ...holder.result }] : []));
+      pending = run(prepared.native, results);
+    } catch (error) {
+      release(prepared);
+      return Promise.reject(error);
+    }
+    return pending.then(
+      (value) => {
+        try {
+          return finish(prepared, value);
+        } finally {
+          release(prepared);
+        }
+      },
+      (error: unknown) => {
+        release(prepared);
+        throw error;
+      },
+    );
   };
 
   const methodName = kind === "propget" ? `_get_${name}` : kind === "propput" ? `_set_${name}` : kind === "propputref" ? `_setref_${name}` : name;
@@ -714,6 +771,7 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
     property: name,
     dispid: dispidFlag?.dispid ?? null,
     marshal,
+    marshalAsync,
     requiredArguments: required,
     inputArguments: inputs.length,
     params: Object.freeze(infos),

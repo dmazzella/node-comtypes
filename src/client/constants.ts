@@ -1,7 +1,7 @@
 import type { COMPointer } from "../pointer.ts";
 import type { ComObject } from "../commethod.ts";
 import type { TypeLibModule } from "../typelib/build.ts";
-import { GetModule } from "../typelib/getmodule.ts";
+import { getModuleSync } from "../typelib/getmodule.ts";
 import { typeLibOf } from "../typelib/load.ts";
 
 /** Constants of a type library by name: enum members, module constants and enums. */
@@ -60,5 +60,5 @@ function constantsOf(module: TypeLibModule): ConstantsObject {
  */
 export function Constants(object: COMPointer | ComObject): ConstantsObject {
   using library = typeLibOf(object);
-  return constantsOf(GetModule(library));
+  return constantsOf(getModuleSync(library));
 }
