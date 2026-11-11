@@ -55,6 +55,7 @@ flowchart TD
     FFI["node-ctypes: WinDLL, WINFUNCTYPE, callback, readValue, memmove"]
     OS["COM runtime di Windows"]
     APP --> CLI --> AUT --> PTR
+    CLI --> EXE
     APP --> SRV --> AUT
     CLI --> TLB --> CM
     SRV --> TLB
@@ -84,20 +85,24 @@ flowchart TD
 2. crea uno `Slot` per ogni metodo proprio, che ricorda l'interfaccia dichiarante (nome e IID);
    gli slot della base vengono riusati, quindi l'indice vtable di un metodo e' lo stesso
    in tutte le interfacce derivate;
-3. genera `class POINTER(Name) extends base.Pointer` (o `COMPointer`) e installa sul
-   prototype un metodo per ogni metodo proprio; i nomi gia' presenti su `COMPointer`
-   (`QueryInterface`, `AddRef`, `Release`) non vengono sovrascritti, come in comtypes;
-4. installa le proprieta' JS degli accessor (`installProperties`, sezione 10) e i membri di dispatch
-   (`installDispatchMembers`, sezione 11, che sintetizza anche `_set_X` per i `DISPPROPERTY` scrivibili);
+3. genera due classi, `POINTER(Name)` (estende `base.Pointer` o `COMPointer`) e `SYNC(Name)` (estende
+   `base.SyncPointer` o `COMPointer`, usata dalle viste `sync()`), e installa un metodo per ogni metodo proprio:
+   su `POINTER` i metodi (`kind: "method"`) passano da `invokeSlotAsync` e restituiscono una Promise, gli
+   accessor `_get_X`/`_set_X`/`_setref_X` restano sincroni; su `SYNC` tutto passa da `invokeSlot`. I nomi gia'
+   presenti su `COMPointer` (`QueryInterface`, `AddRef`, `Release`) non vengono sovrascritti, come in comtypes;
+4. installa su entrambi i prototype le proprieta' JS degli accessor (`installProperties`, sezione 10) e i membri
+   di dispatch (`installDispatchMembers`, sezione 11, che sintetizza anche `_set_X` per i `DISPPROPERTY`
+   scrivibili; sul `POINTER` i `DISPMETHOD` metodo sono asincroni, proprieta' e `_set_X` sincroni);
 5. restituisce una definizione congelata e, salvo `register: false`, la registra per IID (vince la definizione
    piu' recente; `findInterface(iid)`). Il tipo statico accumula le firme in un campo fantasma `__methods`, da
-   cui `InterfacePointer<I>` ricava i metodi tipizzati.
+   cui `InterfacePointer<I>` ricava i metodi tipizzati (asincroni), e in `__sync` le firme sincrone, da cui
+   `SyncPointer<I>` (vista `sync()`).
 
 ## 3. Chiamata di un metodo vtable
 
 ```mermaid
 sequenceDiagram
-    participant JS as link.SetPath(path)
+    participant JS as sync(link).SetPath(path)
     participant P as COMPointer #invoke(slot)
     participant S as Slot.bind
     participant C as functionCache
@@ -149,21 +154,23 @@ errcheck, quindi niente ricorsione. Qualsiasi eccezione interna produce `details
 `0x800Axxxx` (errori VB) senza testo di sistema, dalle stringhe di vbscript.dll se installata.
 Le funzioni libere (`CoCreateInstance`, `CLSIDFromProgID`, ...) usano `checkHRESULT`
 senza `IErrorInfo`, come `OleDLL` in Python. Per le chiamate sull'executor `IErrorInfo` e' letto sul thread
-dell'executor (sezione 20).
+dell'executor (sezione 20) e l'ordine e' invertito: prima `GetErrorInfo` (deve essere la chiamata successiva a
+quella fallita), poi `ISupportErrorInfo`; se l'interfaccia non e' supportata l'oggetto errore viene scartato.
 
 ## 5. Ownership dei puntatori
 
 Ogni `COMPointer` possiede un riferimento, registrato in `tracking.ts` come
 `{ address, generation, released }`.
 
-| Operazione                                                              | Riferimento                                                           |
-| ----------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| costruzione (`fromAddress`, QI, `CoCreateInstance`)                     | `track()`: registrato e messo nel `FinalizationRegistry`              |
-| `fromAddress(p, iface, { addRef: true })` (puntatore preso in prestito) | come sopra, poi `AddRef`                                              |
-| `Release()` / `using`                                                   | `untrack()` e poi `rawRelease()`; il puntatore diventa inutilizzabile |
-| `detach()`                                                              | `untrack()` senza `Release`                                           |
-| GC del puntatore                                                        | il finalizer rilascia solo se `generation` e' quella corrente         |
-| `AddRef()`, `callMethod("Release")`                                     | conteggio raw, non cambia l'ownership                                 |
+| Operazione                                                              | Riferimento                                                                                                                                                                                                                      |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| costruzione (`fromAddress`, QI, `CoCreateInstance`)                     | `track()`: registrato e messo nel `FinalizationRegistry`                                                                                                                                                                         |
+| `fromAddress(p, iface, { addRef: true })` (puntatore preso in prestito) | come sopra, poi `AddRef`                                                                                                                                                                                                         |
+| `Release()` / `using`                                                   | `untrack()`, rilascio del riferimento dell'executor (route proxy) e `rawRelease()`; il puntatore diventa inutilizzabile. Con chiamate `shared` in corso il `Release` viene accodato sull'executor dietro di esse (restituisce 0) |
+| `sync(p)`                                                               | vista che condivide riferimento e stato di `p`: rilasciare l'una rilascia entrambe                                                                                                                                               |
+| `detach()`                                                              | `untrack()` senza `Release`                                                                                                                                                                                                      |
+| GC del puntatore                                                        | il finalizer rilascia solo se `generation` e' quella corrente                                                                                                                                                                    |
+| `AddRef()`, `callMethod("Release")`                                     | conteggio raw, non cambia l'ownership                                                                                                                                                                                            |
 
 ## 6. Apartment e rilascio finale
 
@@ -262,15 +269,17 @@ e lo scode compare nel messaggio. Per i put `pVarResult` e' NULL. `LCID` di defa
 `manage()` (`client/index.ts`, come `comtypes.client._manage`) decide cosa restituiscono `CreateObject`,
 `GetObject` e `GetActiveObject`:
 
-- con `interface`: quella interfaccia (`CreateObject` e `GetObject` la chiedono direttamente a
-  `CoCreateInstance`/`CoGetObject`);
-- con `dynamic: true`: oggetto dinamico (`CreateObject` e `GetObject` chiedono subito `IDispatch`, poi `manage` fa
-  `QueryInterface(IDispatch)`);
-- `CreateObject(coclass)` senza opzioni: l'oggetto viene creato con `coclass.defaultInterface` e quel puntatore
-  e' restituito cosi' com'e', senza `GetBestInterface`;
+- con `interface`: l'oggetto viene ottenuto con `IUnknown` e poi interrogato per quella interfaccia
+  (`CreateObject` con `queryOrDispatch`, quindi una duale non marshalabile ricade sulla variante di dispatch;
+  `GetObject`/`GetActiveObject` con `manage`);
+- con `dynamic: true`: oggetto ottenuto con `IUnknown`, poi `manage` fa `QueryInterface(IDispatch)` e lo avvolge come
+  oggetto dinamico;
+- `CreateObject(coclass)` senza opzioni: l'oggetto viene creato con `IUnknown` e interrogato per
+  `coclass.defaultInterface` (`queryOrDispatch`), senza `GetBestInterface`;
 - altrimenti: oggetto creato con `IUnknown` e passato a `GetBestInterface`; se il risultato e' ancora
   `IDispatch`/`IUnknown` senza tipo, diventa un oggetto dinamico (con `IDispatch`) o resta il puntatore `IUnknown`.
 
+La creazione avviene sull'executor, salvo `home: true` o classi registrate localmente (sezione 20).
 `CreateObject` con `machine` usa `CoCreateInstanceEx` con un `COSERVERINFO`.
 
 `GetBestInterface` (`client/best.ts`, come `comtypes.client.GetBestInterface`) restituisce sempre un nuovo
@@ -293,7 +302,7 @@ flowchart TD
     VT --> LIB["GetContainingTypeLib -> getModuleSync; definizione con quell'IID nel modulo, o findInterface(iid)"]
     LIB --> QI{"QueryInterface(definizione)"}
     QI -->|"ok"| TYPED["puntatore tipizzato"]
-    QI -->|"no, dispinterface"| VIEW["IDispatch visto come la dispinterface (solo Invoke)"]
+    QI -->|"no, dispinterface o duale non marshalabile"| VIEW["IDispatch visto come la dispinterface o come variante di dispatch della duale (client/dual.ts, solo Invoke)"]
     QI -->|"no"| SAME
 ```
 
@@ -308,11 +317,13 @@ flowchart TD
     `GetBestInterface`; il puntatore originale viene rilasciato. Senza typeinfo diventano oggetti dinamici
     (Python lascia il puntatore `IDispatch`). Le interfacce derivate non vengono toccate. A livello di tipi,
     `OutValue` di `IDispatch` e' `AutomationObject`;
-  - `Symbol.iterator` su `IDispatch.Pointer.prototype`: i puntatori tipizzati enumerano `_NewEnum`
-    (`iterateNewEnum`), con gli elementi convertiti da `wrapOutparam`.
+  - `Symbol.iterator` e `Symbol.asyncIterator` su `IDispatch.Pointer.prototype`: i puntatori tipizzati enumerano
+    `_NewEnum` (`iterateNewEnum`, `iterateNewEnumAsync` per `for await`), con gli elementi convertiti da
+    `wrapOutparam`.
 - Gli helper late-bound (`getProperty`, `putProperty`, `invokeMethod`, ...) accettano anche puntatori tipizzati
   derivati da `IDispatch` (`DispatchTarget`): lo stato (cache dei DISPID) e' in una `WeakMap` per puntatore, e
-  i risultati sono oggetti dinamici.
+  i risultati sono oggetti dinamici. `invokeMethod` restituisce una Promise (executor), gli helper di proprieta'
+  sono sincroni.
 - `Constants(obj)` (`client/constants.ts`): `typeLibOf` (`IProvideClassInfo` o `IDispatch::GetTypeInfo`) ->
   `getModuleSync`; dal modulo prende i membri degli enum e le costanti dei `module` (il primo nome vince), poi i
   nomi degli enum e degli alias. Il risultato e' un `Proxy` su un oggetto congelato (in cache per modulo) che
@@ -324,12 +335,13 @@ freccia (quindi chiamabile per `DISPID_VALUE`); lo stato e' in una `WeakMap`.
 ```mermaid
 flowchart TD
     G["get obj.Name"] --> SYM{"simbolo?"}
-    SYM -->|"comPointer, iterator, dispose, toPrimitive, inspect"| SP["gestione dedicata"]
+    SYM -->|"comPointer, iterator, asyncIterator, dispose, toPrimitive, inspect"| SP["gestione dedicata"]
     SYM -->|"'then'"| UN["undefined (non thenable)"]
     SYM -->|nome| ID["GetIDsOfNames (cache case-insensitive)"]
     ID --> TI{"MemberInfo dalla typeinfo?"}
     TI -->|"get senza argomenti obbligatori"| PG["PROPERTYGET -> valore"]
-    TI -->|"metodo o get con argomenti"| MC["funzione: METHOD | PROPERTYGET"]
+    TI -->|"metodo"| MC["funzione asincrona: METHOD | PROPERTYGET (Promise sull'executor; sincrona sulla vista sync())"]
+    TI -->|"get con argomenti"| MS["funzione sincrona: METHOD | PROPERTYGET"]
     TI -->|"solo put"| UND["undefined"]
     TI -->|"nessuna typeinfo / membro dinamico"| TRY["prova PROPERTYGET"]
     TRY -->|"ok"| PG
@@ -345,7 +357,8 @@ flowchart TD
   possiede il proprio riferimento (`using`, `release`, finalizer). `util.inspect` non attraversa i trap:
   il metodo `inspect.custom` e' definito sulla funzione target.
 - Enumerazione: `DISPID_NEWENUM` -> `QueryInterface(IEnumVARIANT)` -> `Next(1)` finche' restituisce `S_OK` con un elemento;
-  il generatore rilascia l'enumeratore anche con `break`.
+  il generatore rilascia l'enumeratore anche con `break`. `for await` usa `iterateNewEnumAsync` (32 `Next(1)`
+  accodati sull'executor, sezione 20).
 
 ## 10. COMMETHOD e idlflags
 
@@ -359,7 +372,7 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-    participant JS as p.Find(x)
+    participant JS as sync(p).Find(x)
     participant S as Slot.call
     participant M as marshal (COMMETHOD)
     participant C as codec per parametro
@@ -383,6 +396,9 @@ sequenceDiagram
     M-->>JS: HRESULT, unico valore o array
 ```
 
+Questo e' il percorso sincrono (vista `sync()`, chiamate interne); `p.Find(x)` sul puntatore tipizzato passa da
+`invokeSlotAsync` -> `Slot.callAsync` -> `marshalAsync` e restituisce una Promise (sezione 20).
+
 | Codec                | in                                                                                                                                                                                                                                                                    | out (holder)                                                                                          |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `BSTR`               | `SysAllocStringLen`, liberato dopo la chiamata                                                                                                                                                                                                                        | puntatore; letto e liberato; `in/out`: BSTR iniziale che il chiamato puo' sostituire                  |
@@ -400,7 +416,9 @@ sequenceDiagram
 
 `SELF` si risolve a runtime con l'interfaccia che dichiara lo slot (`SlotOwner.definition`,
 assegnata alla fine di `COMInterface`); a livello di tipi `COMInterface` restituisce
-`ComInterfaceDef<B, M>`, un'interfaccia ricorsiva che passa se stessa come `Self` a `MethodsOf`.
+`ComInterfaceDef<B, M, D>`, un'interfaccia ricorsiva che passa se stessa come `Self` a `MethodsOf` e
+`SyncMethodsOf`. `MethodsOf` tipizza i metodi come `Promise<...>` (`Asynchronous`), `SyncMethodsOf` li lascia
+sincroni.
 
 Proprieta': `COMInterface` raggruppa gli accessor per `property` e installa sul prototype
 un accessor JS (getter senza argomenti obbligatori; setter se esiste un put con un solo argomento,
@@ -438,8 +456,12 @@ sequenceDiagram
     end
 ```
 
+Il diagramma e' il percorso sincrono. Sul puntatore tipizzato i `DISPMETHOD` metodo usano `callAsync` ->
+`invokeAsync` (`Invoke` sull'executor) e restituiscono una Promise; get e put delle proprieta' restano sincroni.
+
 `installDispatchMembers` (`interface.ts`) crea sul prototype le proprieta' JS (`DISPPROPERTY`, `propget`/`propput`
-senza argomenti obbligatori) e i metodi; per i `DISPPROPERTY` non `readonly` aggiunge `_set_X`.
+senza argomenti obbligatori) e i metodi; per i `DISPPROPERTY` non `readonly` aggiunge `_set_X`. Viene chiamato
+su `Pointer` (metodi asincroni) e su `SyncPointer` (tutto sincrono).
 
 ## 12. COMObject
 
@@ -552,7 +574,7 @@ Marshaling tra processi di un'interfaccia vtable custom:
 
 ```mermaid
 sequenceDiagram
-    participant C as client (CreateObject)
+    participant C as client (CreateObject: CoCreateInstance sull'executor)
     participant O as COM (ole32)
     participant R as registro
     participant S as server Node (-Embedding)
@@ -565,7 +587,7 @@ sequenceDiagram
     alt type library registrata ([oleautomation] o dual)
         R-->>O: PSOAInterface (type library marshaler)
         O-->>C: proxy costruito dalla type library
-        C->>S: ICounter::Add(2, 40) -> 42
+        C->>S: await ICounter::Add(2, 40) -> 42
     else non registrata
         O-->>C: E_NOINTERFACE
     end
@@ -621,7 +643,7 @@ flowchart TD
   `getModuleSync` concorrente costruisce da se': alla fine resta il primo modulo registrato in cache.
 - Libreria tramite proxy (`inProcess` in `load.ts`): la libreria di un oggetto in un altro apartment o processo
   e' un proxy, e leggerla chiamata per chiamata attraverserebbe l'apartment (`htmlfile` in uno STA: 13,5 s invece
-  di 3,5 s). `loadTypeLib` di un puntatore ne legge l'identita' (`TLIBATTR`, una chiamata) e carica la stessa
+  di 3,5 s). `loadTypeLib` di un puntatore, se e' un proxy (`isProxy`), ne legge l'identita' (`TLIBATTR`, una chiamata) e carica la stessa
   libreria registrata con `LoadRegTypeLib`; se non e' registrata (creata in memoria) usa il proxy.
 - `COMObject`: se un'interfaccia viene da una type library (`typeLibLocationOf`), `GetTypeInfo` restituisce
   l'`ITypeInfo` (libreria caricata una volta per LIBID/versione/LCID).
@@ -634,7 +656,8 @@ e non conoscono il file della libreria: per registrare il file con un server ser
 
 I tipi TypeScript sono ricavati dalle spec costruite (`ParamInfo`, `classifyParamType`, `valueType`), non dal
 modello, quindi seguono le stesse regole del runtime: argomenti `in` (opzionali solo in coda), risultato
-HRESULT / valore / tupla, proprieta' (`readonly` senza put, metodo se il get ha argomenti obbligatori), `Omit`
+HRESULT / valore / tupla (in una `Promise` per i metodi; per ogni interfaccia anche `<Nome>SyncMethods`, sincrona,
+per `sync()`), proprieta' (`readonly` senza put, metodo se il get ha argomenti obbligatori), `Omit`
 dei membri ridefiniti rispetto alla base, uscite `IDispatch` tipizzate come `AutomationObject` (come `OutValue`).
 Gli enum sono oggetti con membri letterali e un tipo unione dei valori.
 Gli import dal pacchetto hanno il suffisso `$`, i nomi riservati il suffisso `_`. `--js` compila con l'API di
@@ -660,7 +683,7 @@ dalle type library (`builtinInterfaceDefs`).
 - `viewobject.ts` (`comtypes.viewobject`): `IViewObject` (`Freeze`/`Unfreeze` COMMETHOD, il resto raw: HDC,
   rettangoli, target device, advise sink), `IViewObject2.GetExtent` con `SIZEL` in uscita.
 - `shelllink.ts` (`comtypes.shelllink`): `IShellLinkW`/`IShellLinkA` raw (buffer del chiamante) e la coclass
-  `ShellLink`, un oggetto `CoClass` congelato: `CreateObject(ShellLink)` restituisce `IShellLinkW`.
+  `ShellLink`, un oggetto `CoClass` congelato: `await CreateObject(ShellLink)` restituisce `IShellLinkW`.
 - `stream.ts`: `ISequentialStream`, `IStream` con COMMETHOD (`STATSTG` in uscita, `SELF` per `Clone`).
 
 ## 18. ByRef, record e thread
@@ -730,7 +753,7 @@ proprieta', `QueryInterface`/`Release`, conversioni, `getModuleSync`, `GetEvents
 node-ctypes con coda FIFO, non un worker libuv). Il primo job accodato e' `CoInitializeEx(MTA)`. Le chiamate
 usano `fn.callOn(executor, ...args)`: stesse conversioni di `callAsync`, memoria degli argomenti trattenuta
 fino al completamento, risultato consegnato sul thread JS. L'executor tiene vivo il processo solo con chiamate in
-sospeso. `finalize()` accoda `CoUninitialize`, chiude con drain e attende un giro dell'event loop
+sospeso. `finalize()` (chiamata automaticamente su `beforeExit`) accoda `CoUninitialize`, chiude con drain e attende un giro dell'event loop
 (`setImmediate`), cosi' le Promise delle operazioni drenate, che si risolvono qualche microtask dopo le
 loro chiamate, sono gia' risolte quando la sua si risolve; una chiamata successiva crea un nuovo
 executor e incrementa la generazione (`executorGeneration()`), cosi' i riferimenti posseduti dal precedente
@@ -755,11 +778,13 @@ flowchart TD
     L -->|si| H["home: chiamata sincrona sul thread JS, Promise risolta"]
     L -->|no| M{"home MTA?"}
     M -->|si| S1["shared: stesso indirizzo sull'executor"]
-    M -->|no| F{"COMObject 'free', IAgileObject o FTM?"}
+    M -->|no| F{"COMObject 'free'?"}
     F -->|si| S2["shared + handover dei risultati"]
     F -->|no| P{"indirizzo e' un proxy?"}
-    P -->|no| H
     P -->|si| G["proxy: riferimento dell'executor via GIT"]
+    P -->|no| AG{"IAgileObject o FTM?"}
+    AG -->|si| S2
+    AG -->|no| H
     G -->|interfaccia non marshalabile| H
 ```
 
@@ -831,23 +856,25 @@ eventi arrivano senza `startMessagePump`. Verificato con Electron 45 (`tests/ele
 ## Riferimenti al codice
 
 - [src/interface.ts](./src/interface.ts): `STDMETHOD`, `COMInterface`, `installProperties`, `installDispatchMembers`, registro IID, tipi `InterfacePointer`.
-- [src/pointer.ts](./src/pointer.ts): `COMPointer`, `createSlot`, errcheck.
+- [src/pointer.ts](./src/pointer.ts): `COMPointer`, `createSlot`, errcheck, route asincrone, `invokeSlotAsync`, `sync()`.
 - [src/tracking.ts](./src/tracking.ts): riferimenti, generazioni, finalizer.
 - [src/runtime.ts](./src/runtime.ts): apartment e creazione oggetti.
 - [src/errors.ts](./src/errors.ts), [src/errorinfo.ts](./src/errorinfo.ts): `COMError`, messaggi VB, `IErrorInfo`.
 - [src/guid.ts](./src/guid.ts): `GUID`.
+- [src/hresult.ts](./src/hresult.ts), [src/constants.ts](./src/constants.ts): codici HRESULT e costanti.
 - [src/low-level](./src/low-level): binding lazy, accesso vtable raw, BSTR e memoria, registro (`registry.ts`).
 - [src/automation/variant.ts](./src/automation/variant.ts): `VARIANT`, codec, SAFEARRAY.
 - [src/automation/date.ts](./src/automation/date.ts), [src/automation/decimal.ts](./src/automation/decimal.ts): DATE, DECIMAL, CY.
-- [src/automation/dispatch.ts](./src/automation/dispatch.ts): `getIDsOfNames`, `invoke`; [src/automation/types.ts](./src/automation/types.ts): `DISPPARAMS`, `EXCEPINFO`.
+- [src/automation/dispatch.ts](./src/automation/dispatch.ts): `getIDsOfNames`, `invoke`, `invokeAsync`, `prepareInvoke`; [src/automation/types.ts](./src/automation/types.ts): `DISPPARAMS`, `EXCEPINFO`.
 - [src/automation/members.ts](./src/automation/members.ts): typeinfo, `MemberInfo`.
 - [src/automation/record.ts](./src/automation/record.ts): `IRecordInfo`, `record`.
+- [src/automation/named.ts](./src/automation/named.ts): `named()`, argomenti con nome.
 - [src/commethod.ts](./src/commethod.ts): `COMMETHOD`, tipi di parametro, codec, marshal, `setOutputWrapper`.
 - [src/dispmethod.ts](./src/dispmethod.ts): `DISPMETHOD`, `DISPPROPERTY`.
-- [src/client/index.ts](./src/client/index.ts): `CreateObject`, `GetObject`, `GetActiveObject`, `manage`.
-- [src/client/best.ts](./src/client/best.ts): `GetBestInterface`, `wrapOutparam`, iterazione dei puntatori tipizzati.
+- [src/client/index.ts](./src/client/index.ts): `CreateObject`, `GetObject`, `GetActiveObject`, `manage`, `manageLoaded`, `obtain`/`obtainHome`, `sync`.
+- [src/client/best.ts](./src/client/best.ts): `GetBestInterface`, `loadBestModule`, `wrapOutparam`, iterazione dei puntatori tipizzati.
 - [src/client/constants.ts](./src/client/constants.ts): `Constants`.
-- [src/client/dynamic.ts](./src/client/dynamic.ts): proxy dinamico, helper late-bound, `iterateNewEnum`.
+- [src/client/dynamic.ts](./src/client/dynamic.ts): proxy dinamico, helper late-bound, `iterateNewEnum`, `iterateNewEnumAsync`.
 - [src/client/events.ts](./src/client/events.ts): `GetEvents`, `ShowEvents`.
 - [src/server/comobject.ts](./src/server/comobject.ts): `COMObject`, vtable, `classTypeLib`, `VariantEnumerator`, `ConnectionPoint`, `ClassFactory`.
 - [src/server/automation.ts](./src/server/automation.ts): IDispatch lato server, `DispatchError`, `ReturnHRESULT`.
@@ -858,5 +885,5 @@ eventi arrivano senza `startMessagePump`. Verificato con Electron 45 (`tests/ele
 - [src/threads.ts](./src/threads.ts): marshaling tra thread, GIT.
 - [src/executor](./src/executor): executor COM (`executor.ts`), route, GIT e handover (`apartment.ts`), `run` (`operations.ts`), classi locali (`classes.ts`).
 - [src/client/dual.ts](./src/client/dual.ts): varianti di dispatch delle interfacce duali.
-- [src/typelib](./src/typelib): caricamento e registrazione (`load.ts`), modello, build, generatore, `GetModule`; [src/cli.ts](./src/cli.ts): CLI.
+- [src/typelib](./src/typelib): caricamento e registrazione (`load.ts`, `inProcess`), modello, build, generatore, `GetModule`, esecuzione a fette (`steps.ts`: `runSync`, `runSliced`), `CoClass` e `typeLibLocationOf` (`coclass.ts`); [src/cli.ts](./src/cli.ts): CLI.
 - [src/interfaces](./src/interfaces): interfacce predefinite (`dispatch.ts`, `typeinfo.ts`, `persist.ts`, `servprov.ts`, `viewobject.ts`, `shelllink.ts`, `stream.ts`, ...).
