@@ -4,6 +4,7 @@ import { VARIANT } from "../automation/variant.ts";
 import { GUID } from "../guid.ts";
 import { BSTR, COMMETHOD, LPOLESTR, REFGUID } from "../commethod.ts";
 import { COMInterface, HRESULT, STDMETHOD } from "../interface.ts";
+import { refreshMirror } from "../low-level/native.ts";
 import { IUnknown } from "./unknown.ts";
 
 const { POINTER, c_int16, c_int32, c_uint16, c_uint32, c_void_p, c_wchar_p } = ctypes;
@@ -18,6 +19,7 @@ export class TYPEDESC extends ctypes.Structure {
   declare vt: number;
   /** `HREFTYPE` for `VT_USERDEFINED`. */
   get hreftype(): number {
+    refreshMirror(this._buffer);
     return this._buffer.readUInt32LE(0);
   }
 }
@@ -97,6 +99,7 @@ export class VARDESC extends ctypes.Structure {
   declare wVarFlags: number;
   declare varkind: number;
   get oInst(): number {
+    refreshMirror(this._buffer);
     return this._buffer.readUInt32LE(ctypes.sizeof(c_void_p) === 8 ? 16 : 8);
   }
 }

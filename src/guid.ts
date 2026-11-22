@@ -1,5 +1,5 @@
 import * as ctypes from "node-ctypes";
-import { ole32, takeCoTaskMemString } from "./low-level/native.ts";
+import { ole32, refreshMirror, takeCoTaskMemString } from "./low-level/native.ts";
 import { checkHRESULT } from "./errors.ts";
 
 const GUID_PATTERN = /^\{?([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})\}?$/i;
@@ -43,6 +43,7 @@ export class GUID extends ctypes.Structure {
       Buffer.from(match[4] + match[5], "hex").copy(this._buffer, 8);
       return;
     }
+    if (init instanceof GUID) refreshMirror(init._buffer);
     const bytes = init instanceof GUID ? init._buffer : init;
     if (!(bytes instanceof Uint8Array) || bytes.length !== 16) throw new TypeError("GUID requires a GUID string, another GUID or exactly 16 bytes");
     this._buffer.set(bytes);
@@ -76,15 +77,20 @@ export class GUID extends ctypes.Structure {
 
   equals(other: GUIDLike | null | undefined): boolean {
     if (other === null || other === undefined) return false;
-    return toGUID(other)._buffer.equals(this._buffer);
+    const target = toGUID(other);
+    refreshMirror(target._buffer);
+    refreshMirror(this._buffer);
+    return target._buffer.equals(this._buffer);
   }
 
   isNull(): boolean {
+    refreshMirror(this._buffer);
     return this._buffer.every((byte) => byte === 0);
   }
 
   /** `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (uppercase, as `StringFromGUID2`). */
   toString(): string {
+    refreshMirror(this._buffer);
     const hex = (value: number, width: number) => value.toString(16).padStart(width, "0");
     const tail = this._buffer.subarray(8, 16).toString("hex");
     return `{${hex(this.Data1, 8)}-${hex(this.Data2, 4)}-${hex(this.Data3, 4)}-${tail.slice(0, 4)}-${tail.slice(4)}}`.toUpperCase();

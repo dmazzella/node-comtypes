@@ -217,8 +217,8 @@ function releaseIncoming(values: readonly unknown[]): void {
 
 function fillException(pExcepInfo: bigint, object: COMObject, error: unknown): void {
   const type = object.constructor as typeof COMObject;
+  ctypes.memset(pExcepInfo, 0, ctypes.sizeof(EXCEPINFO));
   const info = EXCEPINFO.from_address(pExcepInfo);
-  info._buffer.fill(0);
   const description = error instanceof COMError ? (error.details?.description ?? error.text) : error instanceof Error ? error.message : String(error);
   info.bstrSource = allocBSTR(type._reg_progid_ ?? type.name);
   info.bstrDescription = allocBSTR(description);

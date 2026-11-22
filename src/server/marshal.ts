@@ -11,7 +11,7 @@ import type { GUIDLike } from "../guid.ts";
 import { DISP_E_PARAMNOTFOUND } from "../hresult.ts";
 import { derivesFrom } from "../interface.ts";
 import type { InterfaceDef } from "../interface.ts";
-import { allocBSTR, ole32, oleaut32, readBSTR, readMemory, writeMemory } from "../low-level/native.ts";
+import { allocBSTR, flushMirror, ole32, oleaut32, readBSTR, readMemory, writeMemory } from "../low-level/native.ts";
 import { rawAddRef, rawQueryInterface, rawRelease } from "../low-level/vtable.ts";
 import { COMPointer } from "../pointer.ts";
 
@@ -178,7 +178,10 @@ export function encodeOutput(kind: ParamKind, address: bigint, value: unknown, i
     case "variant": {
       const view = VARIANT.from_address(address);
       if (inout) clearVariant(view._buffer);
-      else view._buffer.fill(0);
+      else {
+        view._buffer.fill(0);
+        flushMirror(view._buffer);
+      }
       writeVariant(view._buffer, value);
       return;
     }

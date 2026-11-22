@@ -4,7 +4,7 @@ import { GUID } from "../guid.ts";
 import { DISP_E_PARAMNOTFOUND } from "../hresult.ts";
 import { derivesFrom, findInterface } from "../interface.ts";
 import type { InterfaceDef } from "../interface.ts";
-import { allocBSTR, oleaut32, POINTER_SIZE, readBSTR, readMemory, writeMemory } from "../low-level/native.ts";
+import { allocBSTR, flushMirror, oleaut32, POINTER_SIZE, readBSTR, readMemory, refreshMirror, writeMemory } from "../low-level/native.ts";
 import { rawAddRef, rawQueryInterface, rawRelease } from "../low-level/vtable.ts";
 import { RecordInfo, recordParts } from "./record.ts";
 import { COMPointer, setArgumentInspector, sharedWithExecutor } from "../pointer.ts";
@@ -139,6 +139,7 @@ export function writeReference(address: bigint, vt: number, value: unknown): voi
     } else {
       writeDecimal(view._buffer, 0, value as string | number | bigint);
       view._buffer.writeUInt16LE(0, 0);
+      flushMirror(view._buffer);
     }
     return;
   }
@@ -292,6 +293,7 @@ function readScalar(vt: number, buffer: Buffer, offset: number): unknown {
 
 /** Convert the VARIANT in `buffer` to a JavaScript value. COM objects are returned as new owned pointers. */
 export function readVariant(buffer: Buffer): unknown {
+  refreshMirror(buffer);
   const vt = buffer.readUInt16LE(0);
   // VT_RECORD (also by reference): pvRecord and pRecInfo.
   if ((vt & ~VT_BYREF) === VT_RECORD) {
@@ -314,6 +316,7 @@ export function readVariant(buffer: Buffer): unknown {
 
 /** Exact text of a `VT_DECIMAL` or `VT_CY` VARIANT (the `value` getter returns a number). */
 export function readVariantExact(buffer: Buffer): string {
+  refreshMirror(buffer);
   const vt = buffer.readUInt16LE(0);
   if (vt === VT_DECIMAL) return readDecimal(buffer, 0);
   if (vt === VT_CY) return currencyToString(buffer.readBigInt64LE(DATA));
@@ -562,6 +565,7 @@ export function writeVariant(buffer: Buffer, value: unknown): void {
   if (value instanceof ByRef) throw new TypeError("byRef() values are IDispatch arguments, not VARIANT values");
   if (value instanceof VARIANT) {
     checkHRESULT(oleaut32().VariantCopy(buffer, value._buffer), "VariantCopy");
+    refreshMirror(buffer);
     return;
   }
   const vt = inferVartype(value);
@@ -588,6 +592,7 @@ export function writeVariant(buffer: Buffer, value: unknown): void {
     writeScalar(vt, buffer, DATA, payload);
   }
   buffer.writeUInt16LE(vt, 0);
+  flushMirror(buffer);
 }
 
 function shapeOf(values: unknown, dimensions: number): number[] {
@@ -687,8 +692,10 @@ export function destroySafeArray(psa: bigint | null): void {
 
 /** Release the resources of the VARIANT in `buffer` (`VariantClear`) and reset it to `VT_EMPTY`. */
 export function clearVariant(buffer: Buffer): void {
+  refreshMirror(buffer);
   if (needsClear(buffer.readUInt16LE(0))) checkHRESULT(oleaut32().VariantClear(buffer), "VariantClear");
   buffer.fill(0, 0, VARIANT_SIZE);
+  flushMirror(buffer);
 }
 
 // ── VARIANT ───────────────────────────────────────────────────────────
@@ -777,6 +784,7 @@ export class VARIANT extends ctypes.Structure {
     const api = oleaut32();
     if (lcid === undefined) checkHRESULT(api.VariantChangeType(this._buffer, this._buffer, flags, vt), "VariantChangeType");
     else checkHRESULT(api.VariantChangeTypeEx(this._buffer, this._buffer, lcid, flags, vt), "VariantChangeTypeEx");
+    refreshMirror(this._buffer);
     return this;
   }
 

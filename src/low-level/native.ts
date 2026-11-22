@@ -140,6 +140,26 @@ export function writeMemory(address: bigint, data: Uint8Array): void {
   if (data.length) ctypes.memmove(address, data, data.length);
 }
 
+/**
+ * Copy current native bytes into `buffer` when external buffers are disabled
+ * (`NODE_CTYPES_NO_EXTERNAL_BUFFERS=1` / Electron). No-op when `EXTERNAL_BUFFERS` is true.
+ */
+export function refreshMirror(buffer: Buffer): void {
+  if (ctypes.EXTERNAL_BUFFERS || !buffer.length) return;
+  const copy = Buffer.allocUnsafe(buffer.length);
+  ctypes.memmove(copy, buffer, buffer.length);
+  copy.copy(buffer);
+}
+
+/**
+ * Copy bytes from `buffer` back to native memory when external buffers are disabled
+ * (`NODE_CTYPES_NO_EXTERNAL_BUFFERS=1` / Electron). No-op when `EXTERNAL_BUFFERS` is true.
+ */
+export function flushMirror(buffer: Buffer): void {
+  if (ctypes.EXTERNAL_BUFFERS || !buffer.length) return;
+  ctypes.memmove(buffer, Buffer.from(buffer), buffer.length);
+}
+
 /** Read a CoTaskMem-allocated wide string and free it. */
 export function takeCoTaskMemString(pointer: bigint | null): string | null {
   if (!pointer) return null;
