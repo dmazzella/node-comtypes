@@ -1,0 +1,24 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts", "src/client/index.ts", "src/automation/index.ts", "src/typelib/index.ts", "src/server/index.ts", "src/interfaces/index.ts", "src/low-level/index.ts"],
+  "tsconfig": "tsconfig.build.json",
+  "out": "docs",
+  "name": "@node-ctypes/comtypes",
+  "readme": "README.md",
+  "includeVersion": true,
+  "sort": ["source-order"],
+  "projectDocuments": ["guides/README.md", "examples/README.md"],
+  "navigationLinks": {
+    "GitHub": "https://github.com/dmazzella/node-comtypes",
+    "npm": "https://www.npmjs.com/package/@node-ctypes/comtypes"
+  },
+  "exclude": ["**/node_modules/**", "**/tests/**", "**/examples/**"],
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "validation": {
+    "notExported": false,
+    "invalidLink": true,
+    "notDocumented": false
+  },
+  "highlightLanguages": ["typescript", "javascript", "python", "bash", "powershell", "json"]
+}
