@@ -9,11 +9,29 @@ import type { Operation } from "./executor/operations.ts";
 import { GUID } from "./guid.ts";
 import { E_NOINTERFACE } from "./hresult.ts";
 import type { InterfaceDef, InterfacePointer, MethodSpec, SyncPointer } from "./interface.ts";
-import { functionCache, rawQueryInterface, rawRelease, vtableEntry } from "./low-level/vtable.ts";
+import { IID_IUnknown } from "./low-level/iids.ts";
+import { functionCache, rawQueryInterface, rawRelease, vtableEntry, vtableEntryFromTable, vtableOf } from "./low-level/vtable.ts";
 import { track, untrack } from "./tracking.ts";
 import type { Reference } from "./tracking.ts";
 
 type Callable = (...args: any[]) => any;
+
+const COM_POINTER_BRAND = Symbol.for("node-comtypes.COMPointer");
+
+function isCOMPointer(value: unknown): value is COMPointer {
+  return value instanceof COMPointer || (typeof value === "object" && value !== null && (value as Record<symbol, unknown>)[COM_POINTER_BRAND] === true);
+}
+
+// Per-interface, per-vtable-pointer bound-slot cache shared across all COMPointer instances of a COM class.
+const vtableMethodCaches = new WeakMap<InterfaceDef<any>, Map<bigint, (Callable | undefined)[]>>();
+
+function vtableSlotsFor(iface: InterfaceDef<any>, vtable: bigint): (Callable | undefined)[] {
+  let byVtable = vtableMethodCaches.get(iface);
+  if (!byVtable) vtableMethodCaches.set(iface, (byVtable = new Map()));
+  let slots = byVtable.get(vtable);
+  if (!slots) byVtable.set(vtable, (slots = []));
+  return slots;
+}
 
 /** How an asynchronous call reaches the executor. */
 export interface AsyncContext {
@@ -43,8 +61,6 @@ export interface SlotOwner {
   readonly iid: GUID;
   definition: InterfaceDef<any> | null;
 }
-
-const IID_IUnknown = new GUID("{00000000-0000-0000-C000-000000000046}");
 
 /**
  * Create the slot for `spec`, declared by interface `owner`. HRESULT methods
@@ -185,12 +201,19 @@ export function sharedWithExecutor(pointer: COMPointer): boolean {
  * handlers, COM servers and code that needs the lowest latency.
  */
 export function sync<I extends InterfaceDef<any>>(pointer: COMPointer<I> | InterfacePointer<I>): SyncPointer<I> {
-  if (!(pointer instanceof COMPointer)) throw new TypeError("sync() expects a COM pointer");
+  if (!isCOMPointer(pointer)) throw new TypeError("sync() expects a COM pointer");
   return createView(pointer) as SyncPointer<I>;
 }
 
 // Set while constructing a synchronous view: the new instance shares this pointer's state.
 let viewOf: COMPointer | null = null;
+
+interface PointerState {
+  route: Route | Promise<Route> | null;
+  inflight: number;
+  view: COMPointer | null;
+  entries: Entries | null;
+}
 
 /**
  * An owned reference to a COM interface. Python equivalent: `POINTER(IUnknown)`.
@@ -205,10 +228,12 @@ let viewOf: COMPointer | null = null;
  * or {@link COMPointer.fromAddress}.
  */
 export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Disposable {
+  readonly [COM_POINTER_BRAND] = true;
   readonly interface: I;
   #reference: Reference;
-  #functions: (Callable | undefined)[] = [];
-  #state: { route: Route | Promise<Route> | null; inflight: number; view: COMPointer | null; entries: Entries | null } = { route: null, inflight: 0, view: null, entries: null };
+  #vtable = 0n;
+  #bound: (Callable | undefined)[] | null = null;
+  #state: PointerState | null = null;
   // A view keeps its pointer (the owner tracked for release) alive.
   #owner: COMPointer | null = null;
 
@@ -217,11 +242,12 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
     invokeAsync = (pointer, slot, args, options) => pointer.#invokeAsync(slot, args, options);
     shared = (pointer) => pointer.#shared();
     createView = (pointer) => {
-      if (pointer.#state.view) return pointer.#state.view;
+      const state = pointer.#ensureState();
+      if (state.view) return state.view;
       viewOf = pointer;
       try {
         const SyncClass = (pointer.interface as InterfaceDef<any>).SyncPointer;
-        return (pointer.#state.view = new SyncClass(pointer.#reference.address, pointer.interface));
+        return (state.view = new SyncClass(pointer.#reference.address, pointer.interface));
       } finally {
         viewOf = null;
       }
@@ -234,12 +260,17 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
     if (viewOf) {
       // A synchronous view: same reference, same state.
       this.#reference = viewOf.#reference;
-      this.#functions = viewOf.#functions;
+      this.#vtable = viewOf.#vtable;
+      this.#bound = viewOf.#bound;
       this.#state = viewOf.#state;
       this.#owner = viewOf;
       return;
     }
     this.#reference = track(address, this);
+  }
+
+  #ensureState(): PointerState {
+    return (this.#state ??= { route: null, inflight: 0, view: null, entries: null });
   }
 
   /** Wrap a raw interface pointer. */
@@ -264,63 +295,70 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
   #invoke(slot: number, args: unknown[]): unknown {
     const { address } = this.#live();
     const binding = this.#slot(slot);
-    let fn = this.#functions[slot];
-    if (fn === undefined) fn = this.#functions[slot] = binding.bind(vtableEntry(address, slot));
+    let bound = this.#bound;
+    if (bound === null) {
+      const vtable = (this.#vtable = vtableOf(address));
+      bound = this.#bound = vtableSlotsFor(this.interface, vtable);
+      if (this.#owner && this.#owner.#bound === null) {
+        this.#owner.#vtable = vtable;
+        this.#owner.#bound = bound;
+      }
+    }
+    let fn = bound[slot];
+    if (fn === undefined) fn = bound[slot] = binding.bind(vtableEntryFromTable(this.#vtable, slot));
     return binding.call(fn, address, args);
+  }
+
+  /** Classify the non-proxy route of `address`, or `null` when it is a cross-apartment proxy. */
+  #classifyRoute(address: bigint): Route | null {
+    const local = localThreading(address);
+    const home = homeApartment();
+    // Objects implemented in JavaScript run their callbacks on the home thread
+    // unless free-threaded; without COM on the home thread, calls stay there.
+    if (local === "apartment" || home === "none") return HOME;
+    if (home === "mta") return SHARED_MTA;
+    if (local === "free") return SHARED_AGILE;
+    // A proxy answers IClientSecurity locally; QueryInterface(IAgileObject) would go to the server.
+    if (isProxy(address)) return null;
+    return isAgile(address) ? SHARED_AGILE : HOME;
   }
 
   /** The route for asynchronous calls, computed once (a `proxy` route again for a new executor). */
   #route(): Route | Promise<Route> {
-    const cached = this.#state.route;
+    const state = this.#ensureState();
+    const cached = state.route;
     if (cached !== null && (cached instanceof Promise || cached.kind !== "proxy" || executorAlive(cached.generation))) return cached;
     const address = this.#live().address;
-    const local = localThreading(address);
-    const home = homeApartment();
-    let route: Route | Promise<Route>;
-    // Objects implemented in JavaScript run their callbacks on the home thread
-    // unless free-threaded; without COM on the home thread, calls stay there.
-    if (local === "apartment" || home === "none") route = HOME;
-    else if (home === "mta") route = SHARED_MTA;
-    else if (local === "free") route = SHARED_AGILE;
-    // A proxy answers IClientSecurity locally; QueryInterface(IAgileObject) would go to the server.
-    else if (isProxy(address)) route = this.#proxyRoute(address);
-    else if (isAgile(address)) route = SHARED_AGILE;
-    else route = HOME;
-    this.#state.entries = null;
-    this.#state.route = route;
+    const classified = this.#classifyRoute(address);
+    const route: Route | Promise<Route> = classified ?? this.#proxyRoute(address, state);
+    state.entries = null;
+    state.route = route;
     return route;
   }
 
-  #proxyRoute(address: bigint): Promise<Route> {
+  #proxyRoute(address: bigint, state: PointerState): Promise<Route> {
     return referenceForExecutor(address, this.interface.iid).then(
       (executorAddress) => {
-        if (!executorAddress) return (this.#state.route = HOME);
+        if (!executorAddress) return (state.route = HOME);
         const route: Route = { kind: "proxy", address: executorAddress, generation: executorGeneration() };
         if (this.#reference.released) {
           releaseOnExecutor(executorAddress, route.generation);
-          return (this.#state.route = HOME);
+          return (state.route = HOME);
         }
-        executorReferences.register(this, { address: executorAddress, generation: route.generation }, this.#state);
-        return (this.#state.route = route);
+        executorReferences.register(this, { address: executorAddress, generation: route.generation }, state);
+        return (state.route = route);
       },
-      () => (this.#state.route = HOME),
+      () => (state.route = HOME),
     );
   }
 
   #shared(): boolean {
-    const route = this.#state.route;
-    if (route !== null && !(route instanceof Promise)) return route.kind === "shared";
-    if (route !== null) return false;
-    const address = this.#live().address;
-    const local = localThreading(address);
-    const home = homeApartment();
-    if (local === "apartment" || home === "none") return false;
-    if (home === "mta") {
-      this.#state.route = SHARED_MTA;
-      return true;
-    }
-    if (local === "free" || (!isProxy(address) && isAgile(address))) {
-      this.#state.route = SHARED_AGILE;
+    const route = this.#state?.route ?? null;
+    if (route !== null) return !(route instanceof Promise) && route.kind === "shared";
+    const classified = this.#classifyRoute(this.#live().address);
+    if (classified === null) return false;
+    if (classified.kind === "shared") {
+      this.#ensureState().route = classified;
       return true;
     }
     return false;
@@ -342,11 +380,12 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
 
   #dispatch(route: Route, slot: number, binding: Slot, args: unknown[], options: AsyncInvokeOptions, current: Operation): Promise<unknown> {
     const reference = this.#live();
+    const state = this.#ensureState();
     // A reference of an executor stopped meanwhile (finalize): route again on the current one.
     if (route.kind === "proxy" && !executorAlive(route.generation)) {
-      if (this.#state.route === route) {
-        this.#state.route = null;
-        this.#state.entries = null;
+      if (state.route === route) {
+        state.route = null;
+        state.entries = null;
       }
       const fresh = this.#route();
       return fresh instanceof Promise ? fresh.then((settled) => this.#dispatch(settled, slot, binding, args, options, current)) : this.#dispatch(fresh, slot, binding, args, options, current);
@@ -363,12 +402,12 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
     const target = route.kind === "proxy" ? route.address : reference.address;
     const handOverResults = route.kind === "proxy" || route.handOver;
     // The vtable of an address does not change: read each entry once.
-    let entries = this.#state.entries;
-    if (entries?.address !== target) entries = this.#state.entries = { address: target, slots: [] };
+    let entries = state.entries;
+    if (entries?.address !== target) entries = state.entries = { address: target, slots: [] };
     const entry = (entries.slots[slot] ??= vtableEntry(target, slot));
-    this.#state.inflight++;
+    state.inflight++;
     return binding.callAsync(entry, target, args, { handOver: handOverResults, results, operation: current }).finally(() => {
-      this.#state.inflight--;
+      state.inflight--;
     });
   }
 
@@ -419,13 +458,15 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
 
   /** Forget the executor's reference of a `proxy` route. */
   #dropExecutorReference(): void {
-    const route = this.#state.route;
+    const state = this.#state;
+    if (!state) return;
+    const route = state.route;
     if (route !== null && !(route instanceof Promise) && route.kind === "proxy") {
-      executorReferences.unregister(this.#state);
+      executorReferences.unregister(state);
       releaseOnExecutor(route.address, route.generation);
     }
-    this.#state.route = null;
-    this.#state.entries = null;
+    state.route = null;
+    state.entries = null;
   }
 
   /**
@@ -435,10 +476,11 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
    */
   Release(): number {
     const reference = this.#live();
-    const route = this.#state.route;
+    const state = this.#state;
+    const route = state?.route ?? null;
     untrack(reference);
     this.#dropExecutorReference();
-    if (this.#state.inflight > 0 && route !== null && !(route instanceof Promise) && route.kind === "shared") {
+    if (state && state.inflight > 0 && route !== null && !(route instanceof Promise) && route.kind === "shared") {
       releaseOnExecutor(reference.address, executorGeneration());
       return 0;
     }
@@ -447,14 +489,17 @@ export class COMPointer<I extends InterfaceDef = InterfaceDef> implements Dispos
 
   /** COM identity: both pointers reach the same `IUnknown`. */
   isSameObject(other: COMPointer): boolean {
-    if (!(other instanceof COMPointer)) throw new TypeError("isSameObject expects a COMPointer");
-    const identity = (pointer: COMPointer) => {
-      const [hr, address] = rawQueryInterface(pointer.address, IID_IUnknown);
+    if (!isCOMPointer(other)) throw new TypeError("isSameObject expects a COMPointer");
+    const a = this.address;
+    const b = other.address;
+    if (a === b) return true;
+    const identity = (addr: bigint) => {
+      const [hr, address] = rawQueryInterface(addr, IID_IUnknown);
       if (hr < 0 || !address) throw new COMError(hr, { method: "IUnknown::QueryInterface" });
       rawRelease(address);
       return address;
     };
-    return identity(this) === identity(other);
+    return identity(a) === identity(b);
   }
 
   /** Give up ownership without releasing: the caller becomes responsible for the reference. */

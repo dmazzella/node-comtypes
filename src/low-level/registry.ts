@@ -55,9 +55,11 @@ export function subkeys(root: bigint, key: string): string[] {
   try {
     const names: string[] = [];
     const name = Buffer.alloc(512);
+    const length = new ctypes.c_uint32();
+    const lengthRef = ctypes.byref(length);
     for (let index = 0; ; index++) {
-      const length = new ctypes.c_uint32(name.length / 2);
-      const result = api().RegEnumKeyExW(handle.value, index, name, ctypes.byref(length), null, null, null, null);
+      length.value = name.length / 2;
+      const result = api().RegEnumKeyExW(handle.value, index, name, lengthRef, null, null, null, null);
       if (result === ERROR_NO_MORE_ITEMS) return names;
       if (result !== ERROR_SUCCESS) throw new Error(`RegEnumKeyExW(${key}) failed with error ${result}`);
       names.push(name.subarray(0, length.value * 2).toString("utf16le"));

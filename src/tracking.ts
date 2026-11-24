@@ -74,10 +74,24 @@ export function initialized(): void {
   state.initCount++;
 }
 
+const teardownHooks = new Set<() => void>();
+
+/** Register a cleanup hook invoked right before the apartment is uninitialized. */
+export function onApartmentTeardown(hook: () => void): void {
+  teardownHooks.add(hook);
+}
+
 /** Account for one CoUninitialize; on the last one, release everything and start a new generation. */
 export function uninitializing(): void {
   if (state.initCount === 0) return;
   if (state.initCount === 1) {
+    for (const hook of teardownHooks) {
+      try {
+        hook();
+      } catch {
+        // Keep tearing down.
+      }
+    }
     releaseAll();
     state.generation++;
   }

@@ -152,20 +152,21 @@ function isObject(value: unknown): boolean {
 function getMember(current: State, name: string, synchronous: boolean): unknown {
   const dispid = dispidOf(current, name);
   const member = memberOf(current, dispid);
-  const syncCaller = (...args: unknown[]) => call(current, name, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET, args);
-  // Methods run on the COM executor (synchronously on a sync() view).
-  const caller = synchronous ? syncCaller : (...args: unknown[]) => callAsync(current, name, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET, args);
   if (member) {
     if (member.get && member.getArguments === 0) return call(current, name, dispid, DISPATCH_PROPERTYGET, []);
-    if (member.method) return caller;
+    if (member.method) {
+      return synchronous ? (...args: unknown[]) => call(current, name, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET, args) : (...args: unknown[]) => callAsync(current, name, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET, args);
+    }
     // A parameterized property: read synchronously.
-    if (member.get) return syncCaller;
+    if (member.get) return (...args: unknown[]) => call(current, name, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET, args);
     return undefined;
   }
   try {
     return call(current, name, dispid, DISPATCH_PROPERTYGET, []);
   } catch (error) {
-    if (error instanceof COMError && BAD_CONTEXT.has(error.hresult)) return caller;
+    if (error instanceof COMError && BAD_CONTEXT.has(error.hresult)) {
+      return synchronous ? (...args: unknown[]) => call(current, name, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET, args) : (...args: unknown[]) => callAsync(current, name, dispid, DISPATCH_METHOD | DISPATCH_PROPERTYGET, args);
+    }
     throw error;
   }
 }

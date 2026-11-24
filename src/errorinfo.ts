@@ -1,15 +1,11 @@
 import * as ctypes from "node-ctypes";
 import { GUID } from "./guid.ts";
 import type { COMErrorDetails } from "./errors.ts";
+import { IID_ISupportErrorInfo } from "./low-level/iids.ts";
 import { oleaut32, takeBSTR } from "./low-level/native.ts";
-import { functionCache, rawQueryInterface, rawRelease, vtableEntry } from "./low-level/vtable.ts";
+import { PointerArgAt, rawQueryInterface, rawRelease, vtableEntry } from "./low-level/vtable.ts";
 
-const { c_int32, c_uint32, c_void_p } = ctypes;
-
-const IID_ISupportErrorInfo = new GUID("{DF0B3D60-548F-101B-8E65-08002B2BD119}");
-// IErrorInfo getters and ISupportErrorInfo::InterfaceSupportsErrorInfo share
-// the HRESULT (this, pointer) signature.
-const PointerArgAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_void_p));
+const { c_uint32, c_void_p } = ctypes;
 
 function readBSTR(errorInfo: bigint, slot: number): string | null {
   const out = new c_void_p();

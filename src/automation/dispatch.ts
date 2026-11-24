@@ -5,7 +5,7 @@ import { GUID_NULL } from "../guid.ts";
 import { DISP_E_EXCEPTION, DISP_E_PARAMNOTFOUND, DISP_E_TYPEMISMATCH, DISP_E_UNKNOWNNAME } from "../hresult.ts";
 import type { InterfacePointer } from "../interface.ts";
 import type { IDispatch } from "../interfaces/dispatch.ts";
-import { POINTER_SIZE, takeBSTR } from "../low-level/native.ts";
+import { POINTER_SIZE, flushMirror, refreshMirror, takeBSTR } from "../low-level/native.ts";
 import { DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPID_PROPERTYPUT, LOCALE_NEUTRAL } from "./constants.ts";
 import { DISPPARAMS, EXCEPINFO } from "./types.ts";
 import { ByRef, VARIANT, VARIANT_SIZE, byRefArgument, clearVariant, missing, readVariant, writeVariant } from "./variant.ts";
@@ -22,7 +22,11 @@ export function setDefaultLCID(lcid: number): void {
 }
 
 function wideStrings(values: readonly string[]): { pointers: Buffer; keep: Buffer[] } {
-  const keep = values.map((value) => Buffer.from(`${value}\0`, "utf16le"));
+  const keep = values.map((value) => {
+    const buffer = Buffer.from(`${value}\0`, "utf16le");
+    flushMirror(buffer);
+    return buffer;
+  });
   const pointers = Buffer.alloc(POINTER_SIZE * values.length);
   keep.forEach((buffer, index) => {
     const address = ctypes.addressof(buffer);
@@ -61,7 +65,10 @@ export interface InvokeOptions {
 const DeferredFillIn = ctypes.WINFUNCTYPE(ctypes.c_int32, ctypes.c_void_p);
 
 function exceptionError(info: EXCEPINFO, method: string, cause: unknown): COMError {
-  if (info.pfnDeferredFillIn) DeferredFillIn(info.pfnDeferredFillIn)(info._buffer);
+  if (info.pfnDeferredFillIn) {
+    DeferredFillIn(info.pfnDeferredFillIn)(info._buffer);
+    refreshMirror(info._buffer);
+  }
   const source = takeBSTR(info.bstrSource);
   // Some servers (e.g. the Scripting runtime) set only the scode.
   const description = takeBSTR(info.bstrDescription) || (info.scode ? systemMessage(info.scode) : null);
@@ -104,6 +111,7 @@ function prepareInvoke(dispid: number, flags: number, args: readonly unknown[], 
   const variants = Buffer.alloc(VARIANT_SIZE * count);
   const dispids = Buffer.alloc(4 * namedDispids.length);
   namedDispids.forEach((id, index) => dispids.writeInt32LE(id, index * 4));
+  flushMirror(dispids);
   const method = `IDispatch::Invoke(${options.name ?? `DISPID ${dispid}`})`;
   const result = new VARIANT();
   const info = new EXCEPINFO();

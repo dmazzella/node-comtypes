@@ -10,7 +10,7 @@ import { derivesFrom } from "../interface.ts";
 import type { InterfaceDef, MethodSpec } from "../interface.ts";
 import { IDispatch } from "../interfaces/dispatch.ts";
 import { IUnknown } from "../interfaces/unknown.ts";
-import { allocBSTR, POINTER_SIZE, readMemory } from "../low-level/native.ts";
+import { allocBSTR, POINTER_SIZE, readMemory, writeMemory } from "../low-level/native.ts";
 import { COMPointer } from "../pointer.ts";
 import { COMObject, VariantEnumerator } from "./comobject.ts";
 import { omittedToUndefined } from "./marshal.ts";
@@ -217,12 +217,12 @@ function releaseIncoming(values: readonly unknown[]): void {
 
 function fillException(pExcepInfo: bigint, object: COMObject, error: unknown): void {
   const type = object.constructor as typeof COMObject;
-  ctypes.memset(pExcepInfo, 0, ctypes.sizeof(EXCEPINFO));
-  const info = EXCEPINFO.from_address(pExcepInfo);
+  const info = new EXCEPINFO();
   const description = error instanceof COMError ? (error.details?.description ?? error.text) : error instanceof Error ? error.message : String(error);
   info.bstrSource = allocBSTR(type._reg_progid_ ?? type.name);
   info.bstrDescription = allocBSTR(description);
   info.scode = error instanceof COMError && error.hresult < 0 ? error.hresult : E_FAIL;
+  writeMemory(pExcepInfo, info._buffer);
 }
 
 /**

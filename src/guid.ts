@@ -1,5 +1,5 @@
 import * as ctypes from "node-ctypes";
-import { ole32, refreshMirror, takeCoTaskMemString } from "./low-level/native.ts";
+import { flushMirror, ole32, refreshMirror, takeCoTaskMemString } from "./low-level/native.ts";
 import { checkHRESULT } from "./errors.ts";
 
 const GUID_PATTERN = /^\{?([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})\}?$/i;
@@ -41,18 +41,21 @@ export class GUID extends ctypes.Structure {
       this.Data2 = parseInt(match[2], 16);
       this.Data3 = parseInt(match[3], 16);
       Buffer.from(match[4] + match[5], "hex").copy(this._buffer, 8);
+      flushMirror(this._buffer);
       return;
     }
     if (init instanceof GUID) refreshMirror(init._buffer);
     const bytes = init instanceof GUID ? init._buffer : init;
     if (!(bytes instanceof Uint8Array) || bytes.length !== 16) throw new TypeError("GUID requires a GUID string, another GUID or exactly 16 bytes");
     this._buffer.set(bytes);
+    flushMirror(this._buffer);
   }
 
   /** A new random GUID (`CoCreateGuid`). Python: `GUID.create_new()`. */
   static createNew(): GUID {
     const guid = new GUID();
     checkHRESULT(ole32().CoCreateGuid(guid._buffer), "CoCreateGuid");
+    refreshMirror(guid._buffer);
     return guid;
   }
 
@@ -60,6 +63,7 @@ export class GUID extends ctypes.Structure {
   static fromProgID(progid: string): GUID {
     const guid = new GUID();
     checkHRESULT(ole32().CLSIDFromProgID(progid, guid._buffer), "CLSIDFromProgID");
+    refreshMirror(guid._buffer);
     return guid;
   }
 

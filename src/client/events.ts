@@ -15,6 +15,7 @@ import { IDispatch } from "../interfaces/dispatch.ts";
 import { IProvideClassInfo, ITypeInfo, ITypeLib } from "../interfaces/typeinfo.ts";
 import { IUnknown } from "../interfaces/unknown.ts";
 import { COMPointer, sync } from "../pointer.ts";
+import { onApartmentTeardown } from "../tracking.ts";
 import type { InvokeArguments } from "../server/automation.ts";
 import { COMObject } from "../server/comobject.ts";
 
@@ -190,6 +191,17 @@ function sinkClassFor(definition: InterfaceDef<any>): new (handler: Handler, nam
   return type;
 }
 
+const activeConnections = new Set<() => void>();
+onApartmentTeardown(() => {
+  for (const disconnect of [...activeConnections]) {
+    try {
+      disconnect();
+    } catch {
+      // Keep tearing down remaining connections.
+    }
+  }
+});
+
 /**
  * Connect `handler` to the events of `source`. Python equivalent:
  * `comtypes.client.GetEvents`.
@@ -219,12 +231,14 @@ export function GetEvents(source: unknown, handler: object, options: GetEventsOp
   const disconnect = () => {
     if (!connected) return;
     connected = false;
+    activeConnections.delete(disconnect);
     try {
-      sync(point).Unadvise(cookie);
+      if (!point.released) sync(point).Unadvise(cookie);
     } finally {
-      point.Release();
+      if (!point.released) point.Release();
     }
   };
+  activeConnections.add(disconnect);
   return {
     cookie,
     interface: definition,

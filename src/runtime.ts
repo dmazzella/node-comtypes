@@ -7,7 +7,7 @@ import { CO_E_NOTINITIALIZED, E_OUTOFMEMORY, E_POINTER } from "./hresult.ts";
 import type { InterfaceDef, InterfacePointer } from "./interface.ts";
 import { IClassFactory } from "./interfaces/classfactory.ts";
 import { IUnknown } from "./interfaces/unknown.ts";
-import { ole32 } from "./low-level/native.ts";
+import { flushMirror, ole32 } from "./low-level/native.ts";
 import { COSERVERINFO, MULTI_QI } from "./low-level/types.ts";
 import { COMPointer } from "./pointer.ts";
 import { initCount, initialized, liveCount, uninitializing } from "./tracking.ts";
@@ -128,8 +128,10 @@ export interface CreateInstanceExOptions extends CreateInstanceOptions {
 export function CoCreateInstanceEx<T extends InterfaceDef = typeof IUnknown>(clsid: GUIDLike, iface?: T, options: CreateInstanceExOptions = {}): InterfacePointer<T> {
   const target = (iface ?? IUnknown) as T;
   const machine = options.machine ? ctypes.create_unicode_buffer(options.machine) : null;
+  if (machine) flushMirror(machine);
   const server = machine ? new COSERVERINFO() : null;
   if (server && machine) server.pwszName = ctypes.addressof(machine);
+  flushMirror(target.iid._buffer);
   const result = new MULTI_QI();
   result.pIID = ctypes.addressof(target.iid);
   const clsctx = options.clsctx ?? (machine ? CLSCTX_SERVER & ~CLSCTX_INPROC_SERVER : CLSCTX_SERVER);

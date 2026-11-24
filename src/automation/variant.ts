@@ -4,6 +4,7 @@ import { GUID } from "../guid.ts";
 import { DISP_E_PARAMNOTFOUND } from "../hresult.ts";
 import { derivesFrom, findInterface } from "../interface.ts";
 import type { InterfaceDef } from "../interface.ts";
+import { IID_IDispatch, IID_IUnknown } from "../low-level/iids.ts";
 import { allocBSTR, flushMirror, oleaut32, POINTER_SIZE, readBSTR, readMemory, refreshMirror, writeMemory } from "../low-level/native.ts";
 import { rawAddRef, rawQueryInterface, rawRelease } from "../low-level/vtable.ts";
 import { RecordInfo, recordParts } from "./record.ts";
@@ -47,9 +48,6 @@ import { currencyToString, readDecimal, writeDecimal } from "./decimal.ts";
 /** Size of a VARIANT: 16 bytes on 32-bit Windows, 24 on 64-bit. */
 export const VARIANT_SIZE = 8 + 2 * POINTER_SIZE;
 const DATA = 8;
-
-const IID_IUnknown = new GUID("{00000000-0000-0000-C000-000000000046}");
-const IID_IDispatch = new GUID("{00020400-0000-0000-C000-000000000046}");
 
 /**
  * Objects exposing a COM pointer under this symbol (e.g. dynamic dispatch
@@ -357,8 +355,52 @@ export function readSafeArray(psa: bigint, vtHint = VT_VARIANT): unknown[] | nul
   } finally {
     api.SafeArrayUnaccessData(psa);
   }
+  if (dimensions <= 1) {
+    const length = lengths[0] ?? 0;
+    if (records) return records;
+    const out = new Array<unknown>(length);
+    switch (vt) {
+      case VT_UI1:
+        for (let i = 0; i < length; i++) out[i] = bytes[i];
+        return out;
+      case VT_I1:
+        for (let i = 0; i < length; i++) out[i] = bytes.readInt8(i);
+        return out;
+      case VT_I2:
+        for (let i = 0; i < length; i++) out[i] = bytes.readInt16LE(i * 2);
+        return out;
+      case VT_UI2:
+        for (let i = 0; i < length; i++) out[i] = bytes.readUInt16LE(i * 2);
+        return out;
+      case VT_I4:
+      case VT_INT:
+        for (let i = 0; i < length; i++) out[i] = bytes.readInt32LE(i * 4);
+        return out;
+      case VT_UI4:
+      case VT_UINT:
+        for (let i = 0; i < length; i++) out[i] = bytes.readUInt32LE(i * 4);
+        return out;
+      case VT_R4:
+        for (let i = 0; i < length; i++) out[i] = bytes.readFloatLE(i * 4);
+        return out;
+      case VT_R8:
+        for (let i = 0; i < length; i++) out[i] = bytes.readDoubleLE(i * 8);
+        return out;
+      case VT_I8:
+        for (let i = 0; i < length; i++) out[i] = bytes.readBigInt64LE(i * 8);
+        return out;
+      case VT_UI8:
+        for (let i = 0; i < length; i++) out[i] = bytes.readBigUInt64LE(i * 8);
+        return out;
+      case VT_BOOL:
+        for (let i = 0; i < length; i++) out[i] = bytes.readInt16LE(i * 2) !== 0;
+        return out;
+      default:
+        for (let i = 0; i < length; i++) out[i] = readScalar(vt, bytes, i * size);
+        return out;
+    }
+  }
   const element = (index: number) => (records ? records[index] : readScalar(vt, bytes, index * size));
-  if (dimensions <= 1) return Array.from({ length: lengths[0] ?? 0 }, (_, index) => element(index));
   // Column-major storage: the first index varies fastest.
   const build = (dimension: number, base: number, stride: number): unknown[] => {
     const length = lengths[dimension];
@@ -621,25 +663,30 @@ export function createSafeArray(vt: number, values: unknown, dimensions = 1): bi
   if (!psa) throw new TypeError(`SafeArrayCreate failed for ${vartypeName(VT_ARRAY | vt)}`);
   const size = elementSize(vt);
   const count = shape.reduce((total, length) => total * length, 1);
-  const data = Buffer.alloc(count * size);
   const target = new ctypes.c_void_p();
   checkHRESULT(api.SafeArrayAccessData(psa, ctypes.byref(target)), "SafeArrayAccessData");
+  // Fast path: 1-D TypedArray with matching VARTYPE copies directly into SAFEARRAY memory (zero intermediate Buffer).
+  if (dimensions === 1 && ArrayBuffer.isView(values) && typedArrayVartype(values) === vt) {
+    try {
+      writeMemory(target.value ?? 0n, new Uint8Array(values.buffer, values.byteOffset, values.byteLength));
+    } finally {
+      api.SafeArrayUnaccessData(psa);
+    }
+    return psa;
+  }
+  const data = Buffer.alloc(count * size);
   let filled = false;
   try {
-    if (dimensions === 1 && ArrayBuffer.isView(values) && typedArrayVartype(values) === vt) {
-      data.set(new Uint8Array(values.buffer, values.byteOffset, values.byteLength));
-    } else {
-      // Column-major storage: the first index varies fastest.
-      const fill = (level: unknown, dimension: number, base: number, stride: number) => {
-        if (!isList(level) || level.length !== shape[dimension]) throw new TypeError("SAFEARRAY values must be rectangular");
-        for (let index = 0; index < level.length; index++) {
-          const flat = base + index * stride;
-          if (dimension === dimensions - 1) writeScalar(vt, data, flat * size, level[index]);
-          else fill(level[index], dimension + 1, flat, stride * shape[dimension]);
-        }
-      };
-      fill(values, 0, 0, 1);
-    }
+    // Column-major storage: the first index varies fastest.
+    const fill = (level: unknown, dimension: number, base: number, stride: number) => {
+      if (!isList(level) || level.length !== shape[dimension]) throw new TypeError("SAFEARRAY values must be rectangular");
+      for (let index = 0; index < level.length; index++) {
+        const flat = base + index * stride;
+        if (dimension === dimensions - 1) writeScalar(vt, data, flat * size, level[index]);
+        else fill(level[index], dimension + 1, flat, stride * shape[dimension]);
+      }
+    };
+    fill(values, 0, 0, 1);
     filled = true;
   } finally {
     // Partially written elements are copied too, so that SafeArrayDestroy frees them on failure.
@@ -792,6 +839,7 @@ export class VARIANT extends ctypes.Structure {
   copy(): VARIANT {
     const copy = new VARIANT();
     checkHRESULT(oleaut32().VariantCopy(copy._buffer, this._buffer), "VariantCopy");
+    refreshMirror(copy._buffer);
     return copy;
   }
 

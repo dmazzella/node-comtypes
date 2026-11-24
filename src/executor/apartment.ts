@@ -10,30 +10,23 @@ import { APTTYPE_MTA, CLSCTX_INPROC_SERVER } from "../constants.ts";
 import { COMError } from "../errors.ts";
 import { GUID } from "../guid.ts";
 import { CO_E_NOTINITIALIZED } from "../hresult.ts";
+import { CLSID_InProcFreeMarshaler, CLSID_StdGlobalInterfaceTable, IID_IAgileObject, IID_IClientSecurity, IID_IDispatch, IID_IGlobalInterfaceTable, IID_IMarshal, IID_IUnknown } from "../low-level/iids.ts";
 import { ole32, oleaut32 } from "../low-level/native.ts";
-import { functionCache, rawQueryInterface, rawRelease, vtableEntry } from "../low-level/vtable.ts";
-import { apartmentGeneration } from "../tracking.ts";
-import { executorAlive, executorGeneration, executorTarget } from "./executor.ts";
+import { functionCache, QueryInterfaceAt, rawQueryInterface, rawRelease, RefCountAt, vtableEntry } from "../low-level/vtable.ts";
+import { apartmentGeneration, initCount, onApartmentTeardown } from "../tracking.ts";
+import { executorAlive, executorGeneration, executorTarget, onExecutorStopping } from "./executor.ts";
 
 const { c_int32, c_uint16, c_uint32, c_void_p } = ctypes;
 
-const CLSID_StdGlobalInterfaceTable = new GUID("{00000323-0000-0000-C000-000000000046}");
-const IID_IGlobalInterfaceTable = new GUID("{00000146-0000-0000-C000-000000000046}");
-const IID_IAgileObject = new GUID("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}");
-const IID_IMarshal = new GUID("{00000003-0000-0000-C000-000000000046}");
-const IID_IClientSecurity = new GUID("{0000013D-0000-0000-C000-000000000046}");
-const IID_IDispatch = new GUID("{00020400-0000-0000-C000-000000000046}");
-const IID_IUnknown = new GUID("{00000000-0000-0000-C000-000000000046}");
-const CLSID_InProcFreeMarshaler = new GUID("{0000033A-0000-0000-C000-000000000046}");
 const MSHCTX_INPROC = 3;
 const MSHLFLAGS_NORMAL = 0;
 
 const RegisterAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p, c_void_p));
 const RevokeAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_uint32));
 const GetAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_uint32, c_void_p, c_void_p));
-const QueryInterfaceAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p));
-const ReleaseAt = functionCache(() => ctypes.WINFUNCTYPE(c_uint32, c_void_p));
 const GetUnmarshalClassAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p, c_uint32, c_void_p, c_uint32, c_void_p));
+
+let cachedHomeApartment: { readonly kind: "mta" | "sta"; readonly count: number; readonly generation: number } | null = null;
 
 /**
  * Apartment of the home thread: `mta` (explicit or implicit: shared with the
@@ -41,11 +34,18 @@ const GetUnmarshalClassAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_vo
  * not initialized there (objects are then called on the home thread).
  */
 export function homeApartment(): "mta" | "sta" | "none" {
+  const count = initCount();
+  const gen = apartmentGeneration();
+  if (count > 0 && cachedHomeApartment !== null && cachedHomeApartment.count === count && cachedHomeApartment.generation === gen) {
+    return cachedHomeApartment.kind;
+  }
   const type = new c_int32();
   const qualifier = new c_int32();
   const hr = ole32().CoGetApartmentType(ctypes.byref(type), ctypes.byref(qualifier));
   if (hr === CO_E_NOTINITIALIZED || hr < 0) return "none";
-  return type.value === APTTYPE_MTA ? "mta" : "sta";
+  const kind = type.value === APTTYPE_MTA ? "mta" : "sta";
+  if (count > 0) cachedHomeApartment = { kind, count, generation: gen };
+  return kind;
 }
 
 function supports(address: bigint, iid: GUID): bigint | null {
@@ -81,6 +81,15 @@ export function isAgile(address: bigint): boolean {
 // The Global Interface Table of the home thread, per apartment generation.
 let homeTable: { readonly address: bigint; readonly generation: number } | null = null;
 
+onApartmentTeardown(() => {
+  cachedHomeApartment = null;
+  if (homeTable) {
+    const addr = homeTable.address;
+    homeTable = null;
+    rawRelease(addr);
+  }
+});
+
 function homeGlobalTable(): bigint {
   const generation = apartmentGeneration();
   if (homeTable?.generation === generation) return homeTable.address;
@@ -92,28 +101,52 @@ function homeGlobalTable(): bigint {
 }
 
 // The executor's own table, per executor generation (created on the executor).
-let executorTable: { readonly address: Promise<bigint>; readonly generation: number } | null = null;
+let executorTable: { readonly address: Promise<bigint>; resolved: bigint | null; readonly generation: number } | null = null;
+
+onExecutorStopping((stopping, gen) => {
+  if (executorTable?.generation === gen) {
+    const entry = executorTable;
+    executorTable = null;
+    if (entry.resolved) {
+      RefCountAt(vtableEntry(entry.resolved, 2))
+        .callOn(stopping, entry.resolved)
+        .catch(() => undefined);
+    }
+  }
+});
 
 function executorGlobalTable(): Promise<bigint> {
   const target = executorTarget();
   const generation = executorGeneration();
   if (executorTable?.generation === generation) return executorTable.address;
   const out = new c_void_p();
-  const address = ole32()
+  const entry: { address: Promise<bigint>; resolved: bigint | null; readonly generation: number } = {
+    address: null as unknown as Promise<bigint>,
+    resolved: null,
+    generation,
+  };
+  entry.address = ole32()
     .CoCreateInstance.callOn(target, CLSID_StdGlobalInterfaceTable._buffer, null, CLSCTX_INPROC_SERVER, IID_IGlobalInterfaceTable._buffer, ctypes.byref(out))
-    .then((hr) => {
-      if (hr < 0 || !out.value) throw new COMError(hr, { method: "CoCreateInstance(StdGlobalInterfaceTable)" });
-      return out.value;
-    });
-  executorTable = { address, generation };
-  return address;
+    .then(
+      (hr) => {
+        if (hr < 0 || !out.value) throw new COMError(hr, { method: "CoCreateInstance(StdGlobalInterfaceTable)" });
+        entry.resolved = out.value;
+        return out.value;
+      },
+      (err) => {
+        if (executorTable === entry) executorTable = null;
+        throw err;
+      },
+    );
+  executorTable = entry;
+  return entry.address;
 }
 
 /** Release a reference owned by the executor thread, after the calls already queued. */
 export function releaseOnExecutor(address: bigint, generation: number): void {
   // An executor that has stopped took its references with its apartment.
   if (!executorAlive(generation)) return;
-  ReleaseAt(vtableEntry(address, 2))
+  RefCountAt(vtableEntry(address, 2))
     .callOn(executorTarget(), address)
     .catch(() => undefined);
 }
@@ -155,7 +188,7 @@ async function handOverPointer(location: bigint, offset: number, interfaceId: GU
   // Agile objects are valid in both apartments: the reference stays as it is.
   const agile = new c_void_p();
   if ((await QueryInterfaceAt(vtableEntry(address, 0)).callOn(target, address, IID_IAgileObject._buffer, ctypes.byref(agile))) >= 0 && agile.value) {
-    void ReleaseAt(vtableEntry(agile.value, 2))
+    void RefCountAt(vtableEntry(agile.value, 2))
       .callOn(target, agile.value)
       .catch(() => undefined);
     return;
@@ -164,7 +197,7 @@ async function handOverPointer(location: bigint, offset: number, interfaceId: GU
   const cookie = new c_uint32();
   const registered = await RegisterAt(vtableEntry(executorTableAddress, 3)).callOn(target, executorTableAddress, address, interfaceId._buffer, ctypes.byref(cookie));
   // The executor's reference is no longer needed: the table holds its own.
-  void ReleaseAt(vtableEntry(address, 2))
+  void RefCountAt(vtableEntry(address, 2))
     .callOn(target, address)
     .catch(() => undefined);
   if (registered < 0) {

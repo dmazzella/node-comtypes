@@ -407,6 +407,7 @@ await dict.Add("counter", counter); // pass it to native code like any COM objec
 - **Late binding** for interfaces deriving from `IDispatch`: the members of the declared interfaces (their `dispid`s, and their parameter names for named arguments) and the public JavaScript members (methods, accessors and fields, not `_`-prefixed); `_com_default_member_` answers `DISPID_VALUE`; iterable objects answer `_NewEnum` with a `VariantEnumerator`. Override `_invoke_` / `_ids_of_names_` to customize. Interfaces built from a type library (`GetModule`, generated modules) also provide their `ITypeInfo` through `GetTypeInfo`.
 - **Lifetime**: native reference counting; while COM holds references the object is kept alive; `_final_release_()` runs when the count drops to zero. `getLiveObjectCount()` helps detect leaks.
 - **Threading**: callbacks run on the JavaScript thread. With `_threading_ = "apartment"` (the default, for STA objects) calls on the object, and calls passing it as an argument, run on the JavaScript thread instead of the executor. `"free"` uses thread-safe callbacks: calls from the executor and other threads are queued to the JavaScript thread and wait for it, so they deadlock while that thread is blocked in a synchronous COM call that waits for them (`sync()`, a call at home).
+- **COM Aggregation & Delegation**: `addressOf(iface?)` exposes the native vtable pointer (usable as the controlling outer `IUnknown` for aggregation); `setAggregateInner(inner, { own? })` delegates unimplemented `QueryInterface` calls to an aggregated inner object; `delegateInterface(iface, target, { own? })` / `undelegateInterface(iface)` forward specific interfaces to another COM object; `releaseAggregate()` releases owned inner/delegated references (also called automatically when the reference count drops to zero).
 
 ### Errors in implementations
 
@@ -444,12 +445,13 @@ A `COMObject` becomes an event source with `static _outgoing_interfaces_` (conne
 
 ### Message pump
 
-| Function                                | Behaviour                                                                                                    |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `startMessagePump({ interval })`        | `PeekMessage`/`DispatchMessage` every few ms from the event loop (unref'd); the JavaScript thread stays free |
-| `await waitFor(condition, { timeout })` | pump until the condition holds                                                                               |
-| `pumpMessages()`                        | dispatch what is queued, without blocking                                                                    |
-| `PumpEvents(ms)`                        | block for `ms` in `CoWaitForMultipleHandles`, dispatching calls and messages (Python: `PumpEvents`)          |
+| Function                                    | Behaviour                                                                                                                            |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `startMessagePump({ mode, interval, ref })` | `"interval"` (default): `PeekMessage`/`DispatchMessage` every few ms; `"wait"`: low-latency `waitAndPumpMessages()` slices (unref'd) |
+| `waitAndPumpMessages(timeoutMs?, limit?)`   | wakes immediately on Win32 messages via `MsgWaitForMultipleObjectsEx` and drains queued messages without spinning                    |
+| `await waitFor(condition, { timeout })`     | pump until the condition holds (using `waitAndPumpMessages` for low-latency wakeups)                                                 |
+| `pumpMessages()`                            | dispatch what is queued, without blocking                                                                                            |
+| `PumpEvents(ms)`                            | block for `ms` in `CoWaitForMultipleHandles`, dispatching calls and messages (Python: `PumpEvents`)                                  |
 
 ## Servers
 
@@ -556,7 +558,7 @@ Visual Basic run-time errors (`FACILITY_CONTROL`, `0x800Axxxx`, e.g. from the Sc
   - `GUID`, HRESULT codes and helpers, `COMError`, `checkHRESULT`;
   - `COMInterface`, `COMMETHOD`, `STDMETHOD`, `DISPMETHOD`, `DISPPROPERTY` and the parameter types (`BSTR`, `LPOLESTR`, `REFGUID`, `SAFEARRAY`, `SELF`, `DATE`, `CURRENCY`, `lazy`, `dispid`, `helpstring`);
   - `COMPointer`, `CoInitializeEx`, `apartment`, `CoCreateInstance(Ex)`, `CoGetClassObject`, `CLSCTX_*` / `COINIT_*`;
-  - message pump: `startMessagePump`, `waitFor`, `pumpMessages`, `PumpEvents`;
+  - message pump: `startMessagePump`, `waitFor`, `pumpMessages`, `waitAndPumpMessages`, `PumpEvents`;
   - threads: `marshalInterface`, `unmarshalInterface`, `unmarshalDispatch`, `releaseMarshaled`, `GlobalInterfaceTable`;
   - execution: `sync`, `run`, `stats`, `finalize`.
 - **`@node-ctypes/comtypes/client`**: `CreateObject`, `GetObject`, `sync`, `GetActiveObject`, `GetBestInterface` / `wrap`, `Constants`, `Dispatch` and the dynamic object helpers (`getProperty`, `putProperty`, `putRefProperty`, `invokeMethod`, `enumerate`, `dispatchPointer`, `isDispatch`, `release`, `memberInfo`, `typeName`), `GetEvents`, `ShowEvents`.
@@ -647,6 +649,7 @@ npm run typecheck
 npm run test:types   # declaration and API type tests
 npm run test:unit    # GUID, HRESULT, layouts, DECIMAL, DATE, VARIANT scalars, type library build and generation: any OS
 npm test             # everything; COM tests are skipped outside Windows
+npm run test:mirror  # full suite under NODE_CTYPES_NO_EXTERNAL_BUFFERS=1 (Electron / mirror mode)
 npm pack --dry-run   # package contents
 ```
 
@@ -658,9 +661,9 @@ Examples, after a build (`node examples/<name>.ts`):
 - [automation.ts](./examples/automation.ts): Scripting.Dictionary, FileSystemObject and WMI;
 - [stream.ts](./examples/stream.ts): `IStream` and COMMETHOD outputs;
 - [server.ts](./examples/server.ts): a `COMObject` with events, used through the vtable, `IDispatch` and native code;
+- [events.ts](./examples/events.ts): WMI event subscription with `GetEvents` and the low-latency `waitAndPumpMessages` / `startMessagePump({ mode: "wait" })` pump;
 - [localserver.ts](./examples/localserver.ts): a LocalServer32 registered with `UseCommandLine`;
 - [active-directory.ts](./examples/active-directory.ts): Active Directory search through ADSI `IDirectorySearch`, with the structures and enums of the Active DS type library;
-- [active-directory-sync.ts](./examples/active-directory-sync.ts): the same search with every call synchronous on the JavaScript thread (`sync()`, `getModuleSync`, `CoGetObject`): faster, but it blocks the event loop for the whole search;
 - [typelib.ts](./examples/typelib.ts): `GetModule` and coclasses.
 
 ## License

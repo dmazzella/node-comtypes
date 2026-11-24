@@ -16,7 +16,7 @@
 
 import { parseArgs } from "node:util";
 import * as ctypes from "node-ctypes";
-import { COINIT_MULTITHREADED, COMInterface, COMMETHOD, GUID, GetModule, GetObject, HRESULT, IUnknown, LPOLESTR, STDMETHOD, apartment, dispatchPointer } from "@node-ctypes/comtypes";
+import { COINIT_MULTITHREADED, COMInterface, COMMETHOD, GUID, GetModule, GetObject, HRESULT, IUnknown, LPOLESTR, STDMETHOD, apartment, dispatchPointer, sync } from "@node-ctypes/comtypes";
 import type { DispatchObject } from "@node-ctypes/comtypes";
 import { readMemory } from "@node-ctypes/comtypes/low-level";
 
@@ -108,9 +108,10 @@ function preferences(entries: readonly (readonly [number, number | boolean])[]):
 
 // ─── Value conversion ────────────────────────────────────────────────
 
-/** Large integers holding a FILETIME (100 ns ticks since 1601). */
-/** Large integers converted from FILETIME (100 ns ticks since 1601) to ISO 8601. */
-const FILETIMES = new Set(["badPasswordTime", "lastLogoff", "lastLogon", "lastLogonTimestamp", "pwdLastSet"]);
+/** Large integers converted from FILETIME (100 ns ticks since 1601) to ISO 8601 (lowercase keys). */
+const FILETIMES = new Set(["accountexpires", "badpasswordtime", "lastlogoff", "lastlogon", "lastlogontimestamp", "lockouttime", "pwdlastset"]);
+const FILETIME_NEVER = 0x7fffffffffffffffn;
+const FILETIME_EPOCH_MS = 11_644_473_600_000n;
 
 /** A binary SID in native memory as "S-1-5-21-...", formatted by Windows. */
 function sidString(address: bigint): string | null {
@@ -139,8 +140,10 @@ function convert(type: number, value: any, attribute: string): unknown {
       return value.Integer;
     case AdsType.ADSTYPE_LARGE_INTEGER: {
       const ticks = BigInt(value.LargeInteger.QuadPart);
-      if (!FILETIMES.has(attribute)) return ticks;
-      return new Date(Number(ticks) / 10_000 - 11_644_473_600_000).toISOString();
+      if (!FILETIMES.has(attribute.toLowerCase())) return ticks;
+      if (ticks <= 0n || ticks >= FILETIME_NEVER) return null;
+      const ms = Number(ticks / 10_000n - FILETIME_EPOCH_MS);
+      return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
     }
     case AdsType.ADSTYPE_UTC_TIME: {
       const time = value.UTCTime;
@@ -155,7 +158,7 @@ function convert(type: number, value: any, attribute: string): unknown {
           return sidString(lpValue);
         case "objectguid": {
           const bytes = readMemory(lpValue, dwLength);
-          return bytes.length === 16 ? new GUID(new Uint8Array(bytes)).toString() : bytes.toString("hex");
+          return bytes.length === 16 ? new GUID(bytes).toString() : bytes.toString("hex");
         }
         default:
           return readMemory(lpValue, dwLength);
@@ -168,11 +171,16 @@ function convert(type: number, value: any, attribute: string): unknown {
 
 /** The values of a column (always an array, also for single-valued attributes). */
 function readColumn(column: any, attribute: string): unknown[] {
-  const values = Array.from({ length: column.dwNumValues }, (_, index) => {
-    const value = Ads._adsvalue.from_address(BigInt(column.pADsValues) + BigInt(index * ADSVALUE_SIZE));
-    return convert(column.dwADsType, value[UNION], attribute);
-  });
-  return values.filter((value) => value !== undefined);
+  const count = Number(column.dwNumValues);
+  if (count <= 0 || !column.pADsValues) return [];
+  const raw = readMemory(BigInt(column.pADsValues), count * ADSVALUE_SIZE);
+  const values: unknown[] = [];
+  for (let index = 0; index < count; index++) {
+    const value = new Ads._adsvalue(raw.subarray(index * ADSVALUE_SIZE, (index + 1) * ADSVALUE_SIZE));
+    const converted = convert(column.dwADsType, value[UNION], attribute);
+    if (converted !== undefined) values.push(converted);
+  }
+  return values;
 }
 
 // ─── Search ──────────────────────────────────────────────────────────
@@ -203,19 +211,23 @@ async function* search(directory: DispatchObject, filter: string, attributes: re
   // LPWSTR array of the attribute names; -1 (0xFFFFFFFF) for all attributes.
   const names = attributes.length ? ctypes.array(ctypes.c_wchar_p, attributes.length)(...attributes) : null;
   const handle = await searcher.ExecuteSearch(filter, names, attributes.length || 0xffffffff);
+  // GetNextRow may hit the network (paging) -> keep async on the executor.
+  // GetNextColumnName / GetColumn / FreeColumn read local row memory only -> call synchronously in the shared MTA.
+  const local = sync(searcher);
   let completed = false;
   try {
     const name = new ctypes.c_void_p();
+    const nameRef = ctypes.byref(name);
     while ((await searcher.GetNextRow(handle)) !== S_ADS_NOMORE_ROWS) {
       const row: Row = {};
-      while ((await searcher.GetNextColumnName(handle, ctypes.byref(name))) !== S_ADS_NOMORE_COLUMNS) {
+      while (local.GetNextColumnName(handle, nameRef) !== S_ADS_NOMORE_COLUMNS) {
         try {
           const attribute = ctypes.wstring_at(name.value!) ?? "";
-          const column = await searcher.GetColumn(handle, name.value);
+          const column = local.GetColumn(handle, name.value);
           try {
             row[attribute] = readColumn(column, attribute);
           } finally {
-            await searcher.FreeColumn(column._buffer);
+            local.FreeColumn(column._buffer);
           }
         } finally {
           FreeADsMem(name.value);
@@ -323,7 +335,13 @@ try {
     using rootDSE = await bind("LDAP://RootDSE");
     base = `LDAP://${await rootDSE.Get("defaultNamingContext")}`;
   }
-  const attributes = options.attributes === "*" ? [] : options.attributes.split(",").map((attribute) => attribute.trim());
+  const attributes =
+    options.attributes === "*"
+      ? []
+      : options.attributes
+          .split(",")
+          .map((attribute) => attribute.trim())
+          .filter(Boolean);
   // The tree is built from the distinguished names.
   if (options.tree && attributes.length && !attributes.some((attribute) => attribute.toLowerCase() === "distinguishedname")) attributes.push("distinguishedName");
 

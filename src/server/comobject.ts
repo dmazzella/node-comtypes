@@ -16,7 +16,8 @@ import { IConnectionPoint, IConnectionPointContainer, IProvideClassInfo2 } from 
 import { IDispatch, IEnumVARIANT } from "../interfaces/dispatch.ts";
 import { ISupportErrorInfo } from "../interfaces/errorinfo.ts";
 import { IUnknown } from "../interfaces/unknown.ts";
-import { POINTER_SIZE, readMemory, writeMemory } from "../low-level/native.ts";
+import { POINTER_SIZE, writeMemory } from "../low-level/native.ts";
+import { QueryInterfaceAt, rawAddRef, rawQueryInterface, rawRelease, readGuidString, vtableEntry } from "../low-level/vtable.ts";
 import { COMPointer, setLocalThreading, sync } from "../pointer.ts";
 import { ReturnHRESULT, dispatchGetIDsOfNames, dispatchInvoke, defaultIdsOfNames, defaultInvoke } from "./automation.ts";
 import type { InvokeArguments } from "./automation.ts";
@@ -45,6 +46,11 @@ interface ClassInfo {
   readonly threading: Threading;
 }
 
+interface OwnedRef {
+  readonly address: bigint;
+  readonly owned: boolean;
+}
+
 interface State {
   references: number;
   readonly info: ClassInfo;
@@ -52,6 +58,10 @@ interface State {
   readonly blocks: readonly Buffer[];
   readonly addresses: readonly bigint[];
   connectionPoints: Map<string, ConnectionPoint> | null;
+  /** Aggregated inner non-delegating `IUnknown` (COM / WinRT aggregation). */
+  inner: OwnedRef | null;
+  /** Delegated interface IID (uppercase braced) -> cached interface pointer. */
+  delegates: Map<string, OwnedRef> | null;
 }
 
 // Block address -> object. Weak: the JavaScript object owns its blocks; while
@@ -298,7 +308,7 @@ export class COMObject {
       return block;
     });
     const addresses = blocks.map((block) => ctypes.addressof(block));
-    this.#state = { references: 0, info, blocks, addresses, connectionPoints: null };
+    this.#state = { references: 0, info, blocks, addresses, connectionPoints: null, inner: null, delegates: null };
     const reference = new WeakRef<COMObject>(this);
     addresses.forEach((address, index) => instances.set(address, { object: reference, index }));
     forget.register(this, Object.freeze([...addresses]));
@@ -318,14 +328,17 @@ export class COMObject {
         this._final_release_();
       } catch (error) {
         (this.constructor as typeof COMObject).onError?.(error, this);
+      } finally {
+        this.releaseAggregate();
       }
     }
     return state.references;
   }
 
-  /** Address of the block implementing `iid`, or `null`. */
+  /** Address of the block implementing `iid` (GUID, GUID string, or pre-normalized uppercase string), or `null`. */
   #blockFor(iid: GUIDLike): bigint | null {
-    const index = this.#state.info.lookup.get(toGUID(iid).toString());
+    const key = typeof iid === "string" && iid.length === 38 && iid[0] === "{" && iid[37] === "}" ? iid.toUpperCase() : toGUID(iid).toString();
+    const index = this.#state.info.lookup.get(key);
     return index === undefined ? null : this.#state.addresses[index];
   }
 
@@ -333,11 +346,28 @@ export class COMObject {
     if (!out) return E_POINTER;
     ctypes.writeValue(out, ctypes.c_void_p, 0n);
     if (!riid) return E_POINTER;
-    const address = this.#blockFor(new GUID(new Uint8Array(readMemory(riid, 16))));
-    if (address === null) return E_NOINTERFACE;
-    this.#addRef();
-    ctypes.writeValue(out, ctypes.c_void_p, address);
-    return S_OK;
+    const iidKey = readGuidString(riid);
+    const index = this.#state.info.lookup.get(iidKey);
+    if (index !== undefined) {
+      this.#addRef();
+      ctypes.writeValue(out, ctypes.c_void_p, this.#state.addresses[index]);
+      return S_OK;
+    }
+    const delegated = this.#state.delegates?.get(iidKey);
+    if (delegated) {
+      rawAddRef(delegated.address);
+      ctypes.writeValue(out, ctypes.c_void_p, delegated.address);
+      return S_OK;
+    }
+    const inner = this.#state.inner;
+    if (inner) {
+      try {
+        return QueryInterfaceAt(vtableEntry(inner.address, 0))(inner.address, riid, out);
+      } catch {
+        return E_NOINTERFACE;
+      }
+    }
+    return E_NOINTERFACE;
   }
 
   #call(iface: InterfaceDef<any>, slot: number, args: unknown[]): unknown {
@@ -373,15 +403,129 @@ export class COMObject {
   }
 
   supportsInterface(iid: GUIDLike): boolean {
-    return this.#blockFor(iid) !== null;
+    if (this.#blockFor(iid) !== null) return true;
+    const guid = toGUID(iid);
+    if (this.#state.delegates?.has(guid.toString())) return true;
+    const inner = this.#state.inner;
+    if (inner) {
+      const [hr, ptr] = rawQueryInterface(inner.address, guid);
+      if (hr >= 0 && ptr) {
+        rawRelease(ptr);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Native address of the vtable block implementing `iface` (default: primary
+   * interface block `[0]`, suitable as `outer` / `baseInterface` in COM or
+   * WinRT aggregation) without adding a reference.
+   */
+  addressOf(iface?: InterfaceDef<any>): bigint {
+    if (!iface) return this.#state.addresses[0];
+    const address = this.#blockFor(iface.iid);
+    if (address === null) throw new COMError(E_NOINTERFACE, { method: `${this.constructor.name}::addressOf(${iface.name})` });
+    return address;
+  }
+
+  /**
+   * Attach an inner non-delegating `IUnknown` for COM / WinRT aggregation.
+   * Any `QueryInterface` for an IID not implemented or delegated by this
+   * object is forwarded to `inner`.
+   *
+   * - Passing a `COMPointer` takes its own `AddRef` (safe with `using inner`).
+   * - Passing a raw `bigint` adopts 1 reference by default (`own: true`); pass
+   *   `{ own: false }` if the caller retains ownership.
+   * - Passing `null` detaches and releases the current owned inner object.
+   */
+  setAggregateInner(inner: COMPointer | bigint | null, options: { readonly own?: boolean } = {}): void {
+    const prev = this.#state.inner;
+    this.#state.inner = null;
+    if (prev?.owned) rawRelease(prev.address);
+    if (inner === null || inner === 0n) return;
+    if (inner instanceof COMPointer) {
+      const addr = inner.address;
+      rawAddRef(addr);
+      this.#state.inner = { address: addr, owned: true };
+      return;
+    }
+    if (typeof inner !== "bigint") throw new TypeError("setAggregateInner expects a COMPointer, bigint address, or null");
+    this.#state.inner = { address: inner, owned: options.own ?? true };
+  }
+
+  /**
+   * Delegate `QueryInterface(iface)` to `target`. Resolves `iface` once and
+   * caches the pointer so incoming native `QueryInterface` calls only `AddRef`.
+   */
+  delegateInterface(iface: InterfaceDef<any>, target: COMPointer | COMObject | bigint, options: { readonly own?: boolean } = {}): void {
+    const key = iface.iid.toString();
+    let entry: OwnedRef;
+    if (target instanceof COMPointer) {
+      const qi = target.QueryInterface(iface);
+      const addr = qi.detach();
+      entry = { address: addr, owned: true };
+    } else if (target instanceof COMObject) {
+      const addr = queryObject(target, iface.iid);
+      if (addr === null) throw new COMError(E_NOINTERFACE, { method: `${this.constructor.name}::delegateInterface(${iface.name})` });
+      entry = { address: addr, owned: true };
+    } else if (typeof target === "bigint" && target !== 0n) {
+      const owned = options.own ?? false;
+      if (!owned) rawAddRef(target);
+      entry = { address: target, owned: true };
+    } else {
+      throw new TypeError("delegateInterface expects a COMPointer, COMObject, or non-NULL bigint address");
+    }
+    const delegates = (this.#state.delegates ??= new Map());
+    const prev = delegates.get(key);
+    delegates.set(key, entry);
+    if (prev?.owned) rawRelease(prev.address);
+  }
+
+  /** Remove a previously delegated interface and release its cached reference. */
+  undelegateInterface(iface: InterfaceDef<any>): void {
+    const delegates = this.#state.delegates;
+    if (!delegates) return;
+    const key = iface.iid.toString();
+    const prev = delegates.get(key);
+    if (!prev) return;
+    delegates.delete(key);
+    if (prev.owned) rawRelease(prev.address);
+  }
+
+  /** Release the attached aggregate inner object and all cached delegate references. */
+  releaseAggregate(): void {
+    const inner = this.#state.inner;
+    this.#state.inner = null;
+    if (inner?.owned) rawRelease(inner.address);
+    const delegates = this.#state.delegates;
+    this.#state.delegates = null;
+    if (delegates) {
+      for (const entry of delegates.values()) {
+        if (entry.owned) rawRelease(entry.address);
+      }
+      delegates.clear();
+    }
   }
 
   /** A new owned pointer to this object (`AddRef`); throws `E_NOINTERFACE`. */
   QueryInterface<T extends InterfaceDef<any>>(iface: T): InterfacePointer<T> {
     const address = this.#blockFor(iface.iid);
-    if (address === null) throw new COMError(E_NOINTERFACE, { method: `${this.constructor.name}::QueryInterface(${iface.name})` });
-    this.#addRef();
-    return COMPointer.fromAddress(address, iface) as InterfacePointer<T>;
+    if (address !== null) {
+      this.#addRef();
+      return COMPointer.fromAddress(address, iface) as InterfacePointer<T>;
+    }
+    const delegated = this.#state.delegates?.get(iface.iid.toString());
+    if (delegated) {
+      rawAddRef(delegated.address);
+      return COMPointer.fromAddress(delegated.address, iface) as InterfacePointer<T>;
+    }
+    const inner = this.#state.inner;
+    if (inner) {
+      const [hr, ptr] = rawQueryInterface(inner.address, iface.iid);
+      if (hr >= 0 && ptr) return COMPointer.fromAddress(ptr, iface) as InterfacePointer<T>;
+    }
+    throw new COMError(E_NOINTERFACE, { method: `${this.constructor.name}::QueryInterface(${iface.name})` });
   }
 
   /** Native `AddRef`/`Release` for code managing references by hand. */
@@ -691,7 +835,7 @@ export class ClassFactory extends COMObject {
     if (outer) return CLASS_E_NOAGGREGATION;
     if (!riid) return E_POINTER;
     const object = new this.type();
-    const address = queryObject(object, new GUID(new Uint8Array(readMemory(riid, 16))));
+    const address = queryObject(object, readGuidString(riid));
     if (address === null) return E_NOINTERFACE;
     ctypes.writeValue(ppv, ctypes.c_void_p, address);
     return S_OK;

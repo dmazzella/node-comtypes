@@ -70,12 +70,12 @@ export * from "./interfaces/index.ts";
 export * from "./automation/index.ts";
 export * from "./client/index.ts";
 export * from "./server/index.ts";
-export { pumpMessages, PumpEvents, startMessagePump, waitFor } from "./pump.ts";
+export { pumpMessages, waitAndPumpMessages, PumpEvents, startMessagePump, waitFor } from "./pump.ts";
 export { DISPMETHOD, DISPPROPERTY } from "./dispmethod.ts";
 export type { DispSpec } from "./dispmethod.ts";
 export * from "./typelib/index.ts";
 export { marshalInterface, unmarshalInterface, unmarshalDispatch, releaseMarshaled, GlobalInterfaceTable, IGlobalInterfaceTable, CLSID_StdGlobalInterfaceTable } from "./threads.ts";
 export type { MarshaledInterface } from "./threads.ts";
-export type { MessagePump } from "./pump.ts";
+export type { MessagePump, StartMessagePumpOptions } from "./pump.ts";
 
 export const version = "0.2.0";

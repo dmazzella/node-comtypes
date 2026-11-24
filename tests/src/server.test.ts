@@ -40,6 +40,8 @@ import {
   getLivePointerCount,
   named,
   startMessagePump,
+  sync,
+  waitAndPumpMessages,
   waitFor,
 } from "@node-ctypes/comtypes";
 import { COMObject, ConnectionPoint, VariantEnumerator, getLiveObjectCount, registerClassObject, registerServer, unregisterServer } from "@node-ctypes/comtypes/server";
@@ -406,5 +408,122 @@ describe("class factories and servers", { skip }, () => {
     using _ = apartment();
     using dynamic = Dispatch(new Calc());
     assert.ok(dispatchPointer(dynamic) instanceof COMPointer);
+  });
+});
+
+describe("COMObject aggregation & delegation", { skip }, () => {
+  const IOuter = COMInterface({
+    name: "IOuter",
+    iid: "{AA112233-4455-6677-8899-AABBCCDDEEFF}",
+    extends: IUnknown,
+    methods: [COMMETHOD([], HRESULT, "OuterValue", [["out", "retval"], c_int32, "val"])],
+  });
+  const IDelegated = COMInterface({
+    name: "IDelegated",
+    iid: "{BB112233-4455-6677-8899-AABBCCDDEEFF}",
+    extends: IUnknown,
+    methods: [COMMETHOD([], HRESULT, "DelegatedValue", [["out", "retval"], c_int32, "val"])],
+  });
+  const IInner = COMInterface({
+    name: "IInner",
+    iid: "{CC112233-4455-6677-8899-AABBCCDDEEFF}",
+    extends: IUnknown,
+    methods: [COMMETHOD([], HRESULT, "InnerValue", [["out", "retval"], c_int32, "val"])],
+  });
+
+  class OuterObj extends COMObject {
+    static _com_interfaces_ = [IOuter];
+    OuterValue() {
+      return 10;
+    }
+  }
+  class DelegatedObj extends COMObject {
+    static _com_interfaces_ = [IDelegated];
+    DelegatedValue() {
+      return 20;
+    }
+  }
+  class InnerObj extends COMObject {
+    static _com_interfaces_ = [IInner];
+    InnerValue() {
+      return 30;
+    }
+  }
+
+  it("forwards QueryInterface to delegated interfaces and aggregate inner and releases cleanly", () => {
+    using _ = apartment();
+    const beforeObjects = getLiveObjectCount();
+    const beforePointers = getLivePointerCount();
+
+    const outer = new OuterObj();
+    const delegated = new DelegatedObj();
+    const inner = new InnerObj();
+
+    assert.ok(outer.addressOf() !== 0n);
+    assert.equal(outer.addressOf(IOuter), outer.addressOf());
+    assert.throws(() => outer.addressOf(IInner), COMError);
+
+    outer.delegateInterface(IDelegated, delegated);
+    {
+      using innerPtr = inner.QueryInterface(IInner);
+      outer.setAggregateInner(innerPtr);
+    }
+
+    assert.equal(outer.supportsInterface(IOuter.iid), true);
+    assert.equal(outer.supportsInterface(IDelegated.iid), true);
+    assert.equal(outer.supportsInterface(IInner.iid), true);
+    assert.equal(outer.supportsInterface(ICalc.iid), false);
+
+    {
+      using pOuter = outer.QueryInterface(IOuter);
+      assert.equal(sync(pOuter).OuterValue(), 10);
+
+      // Native QueryInterface from COMPointer reaches delegated & inner interfaces!
+      using pDelegated = pOuter.QueryInterface(IDelegated);
+      assert.equal(sync(pDelegated).DelegatedValue(), 20);
+
+      using pInner = pOuter.QueryInterface(IInner);
+      assert.equal(sync(pInner).InnerValue(), 30);
+
+      assert.equal(pOuter.tryQueryInterface(ICalc), null);
+
+      // Undelegating removes the interface and releases the delegate reference.
+      outer.undelegateInterface(IDelegated);
+      assert.equal(outer.supportsInterface(IDelegated.iid), false);
+      assert.equal(pOuter.tryQueryInterface(IDelegated), null);
+    }
+
+    // Releasing outer automatically released inner as well -> zero leaked COMObjects or COMPointers!
+    assert.equal(delegated.refCount, 0);
+    assert.equal(inner.refCount, 0);
+    assert.equal(outer.refCount, 0);
+    assert.equal(getLiveObjectCount(), beforeObjects);
+    assert.equal(getLivePointerCount(), beforePointers);
+  });
+});
+
+describe("low-latency message pump", { skip }, () => {
+  it("waitAndPumpMessages wakes immediately on posted Win32 messages and startMessagePump(wait) stops cleanly", async () => {
+    const kernel32 = new ctypes.WinDLL("kernel32.dll");
+    const user32 = new ctypes.WinDLL("user32.dll");
+    const GetCurrentThreadId = kernel32.func("GetCurrentThreadId", ctypes.c_uint32, []);
+    const PostThreadMessageW = user32.func("PostThreadMessageW", ctypes.c_int32, [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint64]);
+    const tid = GetCurrentThreadId();
+
+    // Prime message queue
+    waitAndPumpMessages(0);
+
+    PostThreadMessageW(tid, 0x0401, 0n, 0n);
+    const t0 = performance.now();
+    const handled = waitAndPumpMessages(100);
+    const elapsed = performance.now() - t0;
+    assert.ok(handled >= 1, `Expected at least 1 message, got ${handled}`);
+    assert.ok(elapsed < 50, `Expected immediate wakeup, took ${elapsed}ms`);
+
+    const pump = startMessagePump({ mode: "wait", interval: 4, ref: false });
+    assert.equal(pump.running, true);
+    await delay(20);
+    pump.stop();
+    assert.equal(pump.running, false);
   });
 });

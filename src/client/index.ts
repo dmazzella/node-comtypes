@@ -12,7 +12,7 @@ import { E_POINTER } from "../hresult.ts";
 import type { InterfaceDef, InterfacePointer } from "../interface.ts";
 import { IDispatch } from "../interfaces/dispatch.ts";
 import { IUnknown } from "../interfaces/unknown.ts";
-import { ole32, oleaut32 } from "../low-level/native.ts";
+import { flushMirror, ole32, oleaut32 } from "../low-level/native.ts";
 import { COSERVERINFO, MULTI_QI } from "../low-level/types.ts";
 import { COMPointer, sync as syncPointer } from "../pointer.ts";
 import { CoCreateInstance, CoCreateInstanceEx } from "../runtime.ts";
@@ -146,8 +146,10 @@ function obtainHome(method: string, call: (out: InstanceType<typeof ctypes.c_voi
 /** `CoCreateInstanceEx` for `IUnknown` on the executor (remote machines). */
 function createInstanceEx(target: ctypes.ExecutorTarget, clsid: GUID, clsctx: number, machine: string, out: InstanceType<typeof ctypes.c_void_p>): Promise<number> {
   const name = ctypes.create_unicode_buffer(machine);
+  flushMirror(name);
   const server = new COSERVERINFO();
   server.pwszName = ctypes.addressof(name);
+  flushMirror(IUnknown.iid._buffer);
   const result = new MULTI_QI();
   result.pIID = ctypes.addressof(IUnknown.iid);
   return ole32()

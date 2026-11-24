@@ -8,11 +8,12 @@ import { COINIT_MULTITHREADED } from "../constants.ts";
 import type { COMErrorDetails } from "../errors.ts";
 import { GUID } from "../guid.ts";
 import type { GUIDLike } from "../guid.ts";
+import { IID_ISupportErrorInfo } from "../low-level/iids.ts";
 import { ole32, oleaut32, takeBSTR } from "../low-level/native.ts";
-import { functionCache, vtableEntry } from "../low-level/vtable.ts";
+import { functionCache, PointerArgAt, QueryInterfaceAt, RefCountAt, vtableEntry } from "../low-level/vtable.ts";
 import type { Operation } from "./operations.ts";
 
-const { c_int32, c_uint32, c_void_p } = ctypes;
+const { c_uint32, c_void_p } = ctypes;
 
 /** Counters of the COM executor (`stats()`). */
 export interface ExecutorStats {
@@ -50,12 +51,12 @@ export interface CallOptions {
   readonly operation?: Operation;
 }
 
-const IID_ISupportErrorInfo = new GUID("{DF0B3D60-548F-101B-8E65-08002B2BD119}");
-// IErrorInfo getters and ISupportErrorInfo::InterfaceSupportsErrorInfo share
-// the HRESULT (this, pointer) signature.
-const PointerArgAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_void_p));
-const QueryInterfaceAt = functionCache(() => ctypes.WINFUNCTYPE(c_int32, c_void_p, c_void_p, c_void_p));
-const ReleaseAt = functionCache(() => ctypes.WINFUNCTYPE(c_uint32, c_void_p));
+const executorStopHooks = new Set<(stopping: ctypes.Executor, gen: number) => void>();
+
+/** Register a hook invoked right before an executor runs `CoUninitialize` during `finalize()`. */
+export function onExecutorStopping(hook: (stopping: ctypes.Executor, gen: number) => void): void {
+  executorStopHooks.add(hook);
+}
 
 let executor: ctypes.Executor | null = null;
 let closing: Promise<void> | null = null;
@@ -111,10 +112,18 @@ export function finalize(): Promise<void> {
   if (closing) return closing;
   const stopping = executor;
   if (!stopping) return Promise.resolve();
+  const stoppingGen = generation;
   executor = null;
   if (exitHandler) {
     process.off("beforeExit", exitHandler);
     exitHandler = null;
+  }
+  for (const hook of executorStopHooks) {
+    try {
+      hook(stopping, stoppingGen);
+    } catch {
+      // Keep shutting down.
+    }
   }
   // FIFO: after every accepted call, before the thread stops.
   ole32()
@@ -177,7 +186,7 @@ function takeErrorObject(target: ctypes.Executor): Promise<bigint | null> {
 }
 
 function release(target: ctypes.Executor, address: bigint): void {
-  ReleaseAt(vtableEntry(address, 2))
+  RefCountAt(vtableEntry(address, 2))
     .callOn(target, address)
     .catch(() => undefined);
 }

@@ -6,6 +6,7 @@ import { IUnknown } from "../interfaces/unknown.ts";
 import { oleaut32, POINTER_SIZE, takeBSTR } from "../low-level/native.ts";
 import { functionCache, vtableEntry } from "../low-level/vtable.ts";
 import { COMPointer } from "../pointer.ts";
+import { onApartmentTeardown } from "../tracking.ts";
 import { recordTypeInfoOf } from "../typelib/coclass.ts";
 import { VARIANT_SIZE, clearVariant, readVariant, writeVariant } from "./variant.ts";
 
@@ -26,8 +27,9 @@ const CreateAt = functionCache(() => ctypes.WINFUNCTYPE(c_void_p, c_void_p));
 export const recordInfo: unique symbol = Symbol.for("node-comtypes.recordInfo") as never;
 
 // IRecordInfo address -> wrapper. Record infos are per type (oleaut32 caches
-// them), so this stays small; the pointers are released with the apartment.
+// them), so this stays small; cleared on apartment teardown before CoUninitialize.
 const shared = new Map<bigint, RecordInfo>();
+onApartmentTeardown(() => shared.clear());
 
 /** A user-defined type described by `IRecordInfo`. */
 export class RecordInfo {

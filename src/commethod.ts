@@ -12,7 +12,7 @@ import { GUID, toGUID } from "./guid.ts";
 import type { GUIDLike } from "./guid.ts";
 import { HRESULT, derivesFrom } from "./interface.ts";
 import type { InterfaceDef, InterfacePointer, MethodKind, MethodMarshal, MethodMarshalAsync, MethodSpec } from "./interface.ts";
-import { allocBSTR, ole32, oleaut32, readBSTR, takeCoTaskMemString } from "./low-level/native.ts";
+import { allocBSTR, flushMirror, ole32, oleaut32, readBSTR, refreshMirror, takeCoTaskMemString } from "./low-level/native.ts";
 import { rawAddRef, rawQueryInterface, rawRelease } from "./low-level/vtable.ts";
 import { COMPointer } from "./pointer.ts";
 import type { BorrowedReference } from "./automation/variant.ts";
@@ -467,8 +467,20 @@ function structureCodec(type: new (...args: any[]) => ctypes.Structure): Codec {
     input: make,
     output(initial, hasInitial) {
       const holder = new type();
-      if (hasInitial && initial !== undefined) holder._buffer.set(make(initial)._buffer);
-      return { arg: holder._buffer, read: () => holder, free: () => undefined };
+      if (hasInitial && initial !== undefined) {
+        const src = make(initial);
+        refreshMirror(src._buffer);
+        holder._buffer.set(src._buffer);
+        flushMirror(holder._buffer);
+      }
+      return {
+        arg: holder._buffer,
+        read: () => {
+          refreshMirror(holder._buffer);
+          return holder;
+        },
+        free: () => undefined,
+      };
     },
   };
 }
@@ -661,6 +673,7 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
       defaultValue: spec[3],
     });
   });
+  const paramKinds = infos.map((info) => (info.lcid ? null : classifyParamType(info.type)));
   const codecs = infos.map((info) => {
     if (info.lcid) return lcidCodec;
     const codec = info.output ? outputCodec(info.type) : codecFor(info.type);
@@ -671,6 +684,29 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
   const inputs = infos.filter((info) => info.input);
   const required = inputs.filter((info) => !info.optional).length;
   const hasOutputs = infos.some((info) => info.output);
+  const lowerNames = infos.map((info) => info.name.toLowerCase());
+  const validInputNames = new Set(inputs.map((info) => info.name.toLowerCase()));
+  const hasInterfaceOutputs = infos.some((info, index) => {
+    if (!info.output) return false;
+    const k = paramKinds[index];
+    if (!k) return false;
+    if (k.kind === "interface" || k.kind === "variant" || k.kind === "safearray") return true;
+    return k.kind === "pointer" && (k.base.kind === "interface" || k.base.kind === "variant" || k.base.kind === "safearray");
+  });
+
+  // Fast-path eligibility:
+  // 1) Zero-param method (`Ping()`, `Invoke()`, `Close()`): no allocation at all.
+  const isZeroParam = infos.length === 0;
+  // 2) Pure positional simple-scalar inputs with a single trailing pure-out simple scalar (`Add(a, b) -> int32`).
+  const singleOutSimpleType: ctypes.SimpleCDataConstructor | null =
+    !isZeroParam &&
+    infos.length >= 1 &&
+    infos[infos.length - 1].output &&
+    !infos[infos.length - 1].input &&
+    paramKinds[infos.length - 1]?.kind === "simple" &&
+    infos.slice(0, -1).every((info, i) => info.input && !info.output && !info.lcid && paramKinds[i]?.kind === "simple")
+      ? (paramKinds[infos.length - 1] as Extract<ParamKind, { kind: "simple" }>).type
+      : null;
 
   // Converts the arguments; on failure, releases what was already converted.
   const prepare = (args: readonly unknown[], self: InterfaceDef<any>): Prepared => {
@@ -679,21 +715,26 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
     const last = args[args.length - 1];
     if (last instanceof NamedArguments) {
       positional = args.slice(0, -1);
-      byName = new Map(Object.entries(last.values).map(([key, value]) => [key.toLowerCase(), value]));
-      for (const key of byName.keys()) if (!inputs.some((info) => info.name.toLowerCase() === key)) throw new TypeError(`${name}: unknown argument ${JSON.stringify(key)}`);
+      byName = new Map<string, unknown>();
+      for (const [key, value] of Object.entries(last.values)) {
+        const lower = key.toLowerCase();
+        if (!validInputNames.has(lower)) throw new TypeError(`${name}: unknown argument ${JSON.stringify(lower)}`);
+        byName.set(lower, value);
+      }
     }
     if (positional.length > inputs.length) throw new TypeError(`${name}: expected at most ${inputs.length} arguments, got ${positional.length}`);
-    const prepared: Prepared = { native: [], holders: [], cleanup: [] };
+    const prepared: Prepared = { native: new Array(infos.length), holders: [], cleanup: [] };
     try {
       let position = 0;
-      infos.forEach((info, index) => {
+      for (let index = 0; index < infos.length; index++) {
+        const info = infos[index];
         const codec = codecs[index];
         let value: unknown;
         let supplied = false;
         if (info.input) {
           if (position < positional.length) value = positional[position];
           position++;
-          if (value === undefined && byName?.has(info.name.toLowerCase())) value = byName.get(info.name.toLowerCase());
+          if (value === undefined && byName !== null && byName.has(lowerNames[index])) value = byName.get(lowerNames[index]);
           supplied = value !== undefined;
           if (!supplied && info.hasDefault) {
             value = info.defaultValue;
@@ -704,11 +745,11 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
         if (info.output) {
           const holder = codec.output!(value, info.input && supplied, self);
           prepared.holders.push(holder);
-          prepared.native.push(holder.arg);
+          prepared.native[index] = holder.arg;
         } else {
-          prepared.native.push(codec.input(value, prepared.cleanup, self));
+          prepared.native[index] = codec.input(value, prepared.cleanup, self);
         }
-      });
+      }
       return prepared;
     } catch (error) {
       release(prepared);
@@ -717,49 +758,100 @@ export function COMMETHOD<const I extends readonly IdlFlag[], const R extends ct
   };
   const finish = (prepared: Prepared, result: unknown): unknown => {
     if (!hasOutputs) return result;
-    const values = prepared.holders.map((holder) => wrapOutput(holder.read()));
-    return values.length === 1 ? values[0] : values;
+    const holders = prepared.holders;
+    if (holders.length === 1) return wrapOutput(holders[0].read());
+    return holders.map((holder) => wrapOutput(holder.read()));
   };
 
-  const marshal: MethodMarshal = (fn, address, args, self) => {
-    const prepared = prepare(args, self);
-    try {
-      return finish(prepared, fn(address, ...prepared.native));
-    } finally {
-      release(prepared);
-    }
-  };
-  // The converted arguments stay alive (and owned here) until the call completes.
-  // Promise steps instead of an async function: this runs for every method call.
-  const marshalAsync: MethodMarshalAsync = (run, args, self) => {
-    let prepared: Prepared;
-    let pending: Promise<unknown>;
-    try {
-      prepared = prepare(args, self);
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    try {
-      const results = prepared.holders.flatMap((holder) => (holder.result ? [{ location: ctypes.addressof(holder.arg as Buffer), ...holder.result }] : []));
-      pending = run(prepared.native, results);
-    } catch (error) {
-      release(prepared);
-      return Promise.reject(error);
-    }
-    return pending.then(
-      (value) => {
+  const EMPTY_ARGS: readonly unknown[] = Object.freeze([]);
+  const EMPTY_RESULTS: readonly [] = Object.freeze([]);
+
+  const marshal: MethodMarshal = isZeroParam
+    ? (fn, address, args) => {
+        if (args.length === 0) return fn(address);
+        const prepared = prepare(args, null as never);
         try {
-          return finish(prepared, value);
+          return fn(address, ...prepared.native);
         } finally {
           release(prepared);
         }
-      },
-      (error: unknown) => {
-        release(prepared);
-        throw error;
-      },
-    );
-  };
+      }
+    : singleOutSimpleType
+      ? (fn, address, args, self) => {
+          if (args.length === inputs.length && (args.length === 0 || !(args[args.length - 1] instanceof NamedArguments))) {
+            let allDefined = true;
+            for (let i = 0; i < args.length; i++) {
+              if (args[i] === undefined) {
+                allDefined = false;
+                break;
+              }
+            }
+            if (allDefined) {
+              const out = new singleOutSimpleType();
+              const ref = ctypes.byref(out);
+              if (args.length === 0) fn(address, ref);
+              else if (args.length === 1) fn(address, args[0], ref);
+              else if (args.length === 2) fn(address, args[0], args[1], ref);
+              else fn(address, ...args, ref);
+              return wrapOutput(out.value);
+            }
+          }
+          const prepared = prepare(args, self);
+          try {
+            return finish(prepared, fn(address, ...prepared.native));
+          } finally {
+            release(prepared);
+          }
+        }
+      : (fn, address, args, self) => {
+          const prepared = prepare(args, self);
+          try {
+            return finish(prepared, fn(address, ...prepared.native));
+          } finally {
+            release(prepared);
+          }
+        };
+  // The converted arguments stay alive (and owned here) until the call completes.
+  // Promise steps instead of an async function: this runs for every method call.
+  const marshalAsync: MethodMarshalAsync = isZeroParam
+    ? (run, args) => {
+        if (args.length === 0) return run(EMPTY_ARGS, EMPTY_RESULTS);
+        try {
+          prepare(args, null as never);
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        return run(EMPTY_ARGS, EMPTY_RESULTS);
+      }
+    : (run, args, self) => {
+        let prepared: Prepared;
+        let pending: Promise<unknown>;
+        try {
+          prepared = prepare(args, self);
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        try {
+          const results = hasInterfaceOutputs ? prepared.holders.flatMap((holder) => (holder.result ? [{ location: ctypes.addressof(holder.arg as Buffer), ...holder.result }] : [])) : EMPTY_RESULTS;
+          pending = run(prepared.native, results);
+        } catch (error) {
+          release(prepared);
+          return Promise.reject(error);
+        }
+        return pending.then(
+          (value) => {
+            try {
+              return finish(prepared, value);
+            } finally {
+              release(prepared);
+            }
+          },
+          (error: unknown) => {
+            release(prepared);
+            throw error;
+          },
+        );
+      };
 
   const methodName = kind === "propget" ? `_get_${name}` : kind === "propput" ? `_set_${name}` : kind === "propputref" ? `_setref_${name}` : name;
   return Object.freeze({

@@ -25,6 +25,7 @@ import {
   dispid,
   getLivePointerCount,
   marshalInterface,
+  named,
   record,
   recordInfo,
   releaseMarshaled,
@@ -218,5 +219,64 @@ describe("Visual Basic error messages", { skip }, () => {
     using dict = (await CreateObject(Scripting.Dictionary as CoClass)) as unknown as Disposable & { Add(key: string, value: number): Promise<void> };
     await dict.Add("a", 1);
     await assert.rejects(dict.Add("a", 2), (error: unknown) => error instanceof COMError && error.message.includes(text));
+  });
+});
+
+describe("Mirror mode & teardown safety", { skip }, () => {
+  it("VARIANT.copy(), IDispatch named/put/EXCEPINFO work identically in normal and mirror mode", async () => {
+    using _ = apartment();
+    using original = new VARIANT("mirror-check");
+    using copied = original.copy();
+    assert.equal(copied.vt, VT_BSTR);
+    assert.equal(copied.value, "mirror-check");
+
+    const INamed = COMInterface({
+      name: "INamed",
+      iid: "{9F4E9187-73C8-4A56-8F4B-278A5B7B2B11}",
+      extends: IDispatch,
+      dispMethods: [DISPMETHOD([dispid(1)], VARIANT, "Combine", [["in"], VARIANT, "left"], [["in"], VARIANT, "right"])],
+      register: false,
+    });
+    class Target extends COMObject {
+      static _com_interfaces_ = [INamed];
+      Label = "initial";
+      Combine(left: string, right: string) {
+        return `${left}:${right}`;
+      }
+      Boom() {
+        throw new Error("kaboom-excepinfo");
+      }
+    }
+    const target = new Target();
+    using dyn = Dispatch(target);
+    dyn.Label = "updated";
+    assert.equal(dyn.Label, "updated");
+    assert.equal(await dyn.Combine(named({ right: "B", left: "A" })), "A:B");
+    await assert.rejects(dyn.Boom(), (error: unknown) => error instanceof COMError && error.details?.description === "kaboom-excepinfo");
+  });
+
+  it("GetEvents disconnects automatically on apartment teardown if not explicitly disposed", () => {
+    const ITeardownEvents = COMInterface({
+      name: "ITeardownEvents",
+      iid: "{4C844E2D-1F9E-4989-B24B-D9277A8C1E33}",
+      extends: IDispatch,
+      dispMethods: [DISPMETHOD([dispid(1)], null, "Ping")],
+      register: false,
+    });
+    class Source extends COMObject {
+      static _com_interfaces_ = [IDispatch];
+      static _outgoing_interfaces_ = [ITeardownEvents];
+    }
+    const before = getLiveObjectCount();
+    let conn: { readonly connected: boolean };
+    {
+      using _ = apartment();
+      const source = new Source();
+      // Intentionally omit `using` / `disconnect()` to verify teardown cleanup.
+      conn = GetEvents(source, { Ping() {} });
+      assert.equal(conn.connected, true);
+    }
+    assert.equal(conn.connected, false);
+    assert.equal(getLiveObjectCount(), before);
   });
 });

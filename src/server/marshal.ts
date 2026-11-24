@@ -63,7 +63,7 @@ export function decodeInput(kind: ParamKind, native: unknown, self: InterfaceDef
     case "lpolestr":
       return native ? ctypes.wstring_at(native as bigint) : null;
     case "refguid":
-      return native ? new GUID(new Uint8Array(readMemory(native as bigint, 16))) : null;
+      return native ? new GUID(readMemory(native as bigint, 16)) : null;
     case "safearray":
       return native ? readSafeArray(native as bigint, kind.vt) : null;
     case "interface":
@@ -104,7 +104,7 @@ export function decodeIndirect(kind: ParamKind, address: bigint, self: Interface
     case "variant":
       return omittedToUndefined(readVariant(readMemory(address, VARIANT_SIZE)));
     case "refguid":
-      return new GUID(new Uint8Array(readMemory(address, 16)));
+      return new GUID(readMemory(address, 16));
     case "struct":
       return (kind.type as unknown as typeof ctypes.Structure).from_buffer_copy(readMemory(address, ctypes.sizeof(kind.type as ctypes.StructureClass))) as ctypes.Structure;
     case "simple":

@@ -1,12 +1,11 @@
 import * as ctypes from "node-ctypes";
-import { setTimeout as delay } from "node:timers/promises";
 import { CLSCTX_LOCAL_SERVER } from "../constants.ts";
 import { checkHRESULT } from "../errors.ts";
 import { toGUID } from "../guid.ts";
 import type { GUID } from "../guid.ts";
 import { ole32 } from "../low-level/native.ts";
 import { deleteTree, HKEY_CURRENT_USER, writeString } from "../low-level/registry.ts";
-import { pumpMessages } from "../pump.ts";
+import { waitAndPumpMessages } from "../pump.ts";
 import { CoInitializeEx, CoUninitialize } from "../runtime.ts";
 import { ClassFactory, COMObject, classTypeLib, getLiveObjectCount, queryObject } from "./comobject.ts";
 import { registerTypeLib, unregisterTypeLib } from "../typelib/load.ts";
@@ -167,19 +166,22 @@ export async function runLocalServer(types: readonly ComClass[], options: LocalS
   const locked = () => registrations.some((registration) => registration.factory.locks > 0);
   try {
     const started = performance.now();
+    const sliceMs = options.interval ?? 8;
+    const idleTimeout = options.idleTimeout ?? 2000;
+    const startupTimeout = options.startupTimeout ?? 60_000;
     let served = false;
     let idleSince = performance.now();
     for (;;) {
-      pumpMessages();
+      waitAndPumpMessages(sliceMs);
       const busy = live() > 0 || locked();
       if (busy) {
         served = true;
         idleSince = performance.now();
       }
       const now = performance.now();
-      if (served && !busy && now - idleSince >= (options.idleTimeout ?? 2000)) break;
-      if (!served && now - started >= (options.startupTimeout ?? 60_000)) break;
-      await delay(options.interval ?? 5);
+      if (served && !busy && now - idleSince >= idleTimeout) break;
+      if (!served && now - started >= startupTimeout) break;
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } finally {
     for (const registration of registrations) registration.revoke();
